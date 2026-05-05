@@ -369,7 +369,7 @@ def render_market_schedule_compact() -> None:
                     "F&O":    f"{emoji[fo['status']]} {fo['status']}",
                     "Reason": eq.get("reason") or fo.get("reason") or "",
                 })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 # ────────────────────────── Open-positions panel ─────────────────────────────
@@ -521,7 +521,7 @@ def _render_open_trade_charts(positions: list[dict], pos_econ: list) -> None:
             ),
         )
         st.markdown(f"##### `{sym}`")
-        st.plotly_chart(fig, use_container_width=True,
+        st.plotly_chart(fig, width="stretch",
                         key=f"open_trade_chart_{sym}")
         st.markdown(caption)
 
@@ -582,7 +582,7 @@ def render_open_positions(positions: list[dict]) -> list:
     # breakdown expander as a visual debugger for "is this trade going
     # the way the strategy expected?".
     st.dataframe(
-        edf, use_container_width=True, hide_index=True,
+        edf, width="stretch", hide_index=True,
         column_config={
             "Entry":      st.column_config.NumberColumn(format="₹%.2f"),
             "Now":        st.column_config.NumberColumn(format="₹%.2f"),
@@ -636,7 +636,7 @@ def render_open_positions(positions: list[dict]) -> list:
                     ("Leg total",   f"₹{scn['entry_leg']['total']:.2f}",             f"₹{scn['exit_leg']['total']:.2f}"),
                 ]
                 bdf = pd.DataFrame(lines[1:], columns=lines[0])
-                st.dataframe(bdf, use_container_width=True, hide_index=True)
+                st.dataframe(bdf, width="stretch", hide_index=True)
                 st.caption(
                     f"Gross P&L: ₹{scn['gross_pnl']:+.2f}   |   "
                     f"Total round-trip fees: ₹{scn['fees_total']:.2f} "
@@ -656,7 +656,7 @@ def render_picks_or_underlyings(*, cache, segment: Segment, watchlist: list[str]
                     unsafe_allow_html=True)
         picks = cache.get_json(f"research:{date.today().isoformat()}") or []
         if picks:
-            st.dataframe(pd.DataFrame(picks), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(picks), width="stretch", hide_index=True)
         else:
             st.info("No research picks yet. The 08:30 IST scheduler populates this. "
                     "Run on demand: `python -m cli research`.")
@@ -693,7 +693,7 @@ def render_latest_signals(*, cache, segment: Segment) -> None:
         st.info("Signal keys found but all empty.")
         return
     sig_df = pd.DataFrame(rows).sort_values("ts", ascending=False)
-    st.dataframe(sig_df, use_container_width=True, hide_index=True)
+    st.dataframe(sig_df, width="stretch", hide_index=True)
 
 
 # ────────────────────────── Performance tab ──────────────────────────────────
@@ -728,17 +728,17 @@ def render_performance_tab(*, segment: Segment, summary: dict) -> None:
                      "duration_min", "gross_pnl", "fees", "net_pnl",
                      "exit_reason", "strategy"]
         show_cols = [c for c in show_cols if c in trades_df.columns]
-        st.dataframe(trades_df[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(trades_df[show_cols], width="stretch", hide_index=True)
 
         bs  = pd.DataFrame.from_dict(summary["by_strategy"], orient="index")
         bsm = pd.DataFrame.from_dict(summary["by_symbol"],   orient="index")
         cs1, cs2 = st.columns(2)
         if not bs.empty:
             cs1.markdown("**By strategy**")
-            cs1.dataframe(bs,  use_container_width=True)
+            cs1.dataframe(bs,  width="stretch")
         if not bsm.empty:
             cs2.markdown("**By symbol**")
-            cs2.dataframe(bsm, use_container_width=True)
+            cs2.dataframe(bsm, width="stretch")
 
     today = date.today()
     with st.expander("🪵 Live trade log (raw events)"):
@@ -802,7 +802,7 @@ def render_charts_tab(*, segment: Segment, watchlist: list[str], cfg) -> None:
     fig.update_layout(height=520, xaxis_rangeslider_visible=False,
                       margin=dict(l=10, r=10, t=30, b=10),
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     rfig = go.Figure()
     rfig.add_trace(go.Scatter(x=df.index, y=df["rsi"], name="RSI 14"))
@@ -810,7 +810,7 @@ def render_charts_tab(*, segment: Segment, watchlist: list[str], cfg) -> None:
     rfig.add_hline(y=30, line_dash="dot", line_color="green")
     rfig.update_layout(height=200, title="RSI (14)",
                        margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(rfig, use_container_width=True)
+    st.plotly_chart(rfig, width="stretch")
 
 
 # ────────────────────────── F&O Greeks tab ───────────────────────────────────
@@ -918,7 +918,7 @@ def render_greeks_tab(positions: list[dict]) -> None:
                      help="Vega = ₹ change for a 1.0 absolute IV change "
                           "(divide by 100 for 1%-IV shocks).")
 
-    st.dataframe(pd.DataFrame(greek_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(greek_rows), width="stretch", hide_index=True)
     st.caption(
         "Greeks computed via Black-Scholes at iv=15%, r=7% on the current spot. "
         "For credit spreads / iron condors, Δ and Θ are signed for the SHORT structure. "
@@ -997,7 +997,7 @@ def render_system_tab(cache, segment: Segment) -> None:
     ])
     if not checks_df.empty:
         st.dataframe(
-            checks_df, use_container_width=True, hide_index=True,
+            checks_df, width="stretch", hide_index=True,
             column_config={
                 "":       st.column_config.TextColumn(width="small"),
                 "Check":  st.column_config.TextColumn(width="medium"),
@@ -1064,7 +1064,7 @@ def render_system_tab(cache, segment: Segment) -> None:
                 audit_df = (audit_df
                             .sort_values(["_sort_v", "_sort_seg"], ascending=[True, True])
                             .drop(columns=["_sort_v", "_sort_seg"]))
-            st.dataframe(audit_df, use_container_width=True, hide_index=True,
+            st.dataframe(audit_df, width="stretch", hide_index=True,
                          column_config={"": st.column_config.TextColumn(width="small")})
 
     summary = _hc.get("summary", {}) or {}
@@ -1072,7 +1072,7 @@ def render_system_tab(cache, segment: Segment) -> None:
         with st.expander("📐 Summary metrics"):
             sdf = pd.DataFrame([(k, v) for k, v in summary.items()],
                                columns=["Metric", "Value"])
-            st.dataframe(sdf, use_container_width=True, hide_index=True)
+            st.dataframe(sdf, width="stretch", hide_index=True)
 
     if _hc_history:
         with st.expander(f"🕒 Today's health-check trail ({len(_hc_history)} runs)"):
@@ -1087,7 +1087,7 @@ def render_system_tab(cache, segment: Segment) -> None:
                 }
                 for r in _hc_history
             ])
-            st.dataframe(trail, use_container_width=True, hide_index=True)
+            st.dataframe(trail, width="stretch", hide_index=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1184,7 +1184,7 @@ with st.sidebar.container(border=True):
 # Quick actions.
 with st.sidebar.container(border=True):
     st.markdown("**Quick actions**")
-    if st.button("🔄 Refresh holiday calendar", use_container_width=True,
+    if st.button("🔄 Refresh holiday calendar", width="stretch",
                  help="Force a fresh fetch from NSE"):
         cal = refresh_holidays()
         st.success(f"Refreshed: {cal.last_refresh[:19].replace('T', ' ')} IST")

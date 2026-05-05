@@ -16,6 +16,17 @@ What we **DO** clear (per segment):
 * ``profit_lockin:<segment>`` — daily P&L target halt. Resets per day.
 * ``trail:<segment>:*`` — per-position trailing-stop snapshots.
 
+What we **DO** clear (global, equity-segment only — see note below):
+
+* ``orders`` — the executor's live-state order hash (written in
+  ``Executor._submit``). Audit trail of today's order attempts. The
+  journal files in ``logs/trades/<seg>/YYYY-MM-DD.jsonl`` are the
+  durable audit, so the hash is purely a convenience. Without this
+  cleanup the hash grows unbounded across days (3 stale Apr-30
+  entries were still present on 2026-05-05 morning). Equity-segment
+  only because the hash is global; running it twice a day from both
+  bots would still be correct but redundant.
+
 What we **DO NOT** clear (intentionally):
 
 * ``research:YYYY-MM-DD`` — produced by the 08:30 pre-market agent
@@ -76,6 +87,28 @@ def daily_reset(segment: Segment = Segment.EQUITY) -> Dict[str, int]:
         except Exception as e:
             logger.warning("[daily-reset:{}] could not delete pattern {}: {}", segment.value, pat, e)
             counts[pat] = 0
+
+    # Global ``orders`` hash cleanup — equity bot only, to avoid both
+    # bots redundantly clearing the same global key. The hash is an
+    # audit-only convenience (journal files are the durable trail) so
+    # nuking it daily is safe and prevents stale-day accumulation.
+    if segment == Segment.EQUITY:
+        try:
+            client = cache.client
+            n_before = 0
+            try:
+                n_before = client.hlen("orders") if client.type("orders") == "hash" else 0
+            except Exception:
+                n_before = 0
+            if n_before > 0:
+                cache.delete("orders")
+                counts["orders"] = int(n_before)
+            else:
+                counts["orders"] = 0
+        except Exception as e:
+            logger.warning("[daily-reset:{}] could not clear global orders hash: {}",
+                           segment.value, e)
+            counts["orders"] = 0
 
     total = sum(counts.values())
     if total > 0:

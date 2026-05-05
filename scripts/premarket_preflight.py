@@ -740,11 +740,60 @@ def maker_run_regression_suite() -> tuple[str, str, dict]:
                 "unnecessary 7-day windows or F&O will starve.",
                 {"fix": "14"})
 
+    # ── FIX #15 — daily-loss formula F&O-aware (2026-05-05 PM) ──────────
+    # ``RiskManager._equity`` must add ``margin_blocked`` back for futures
+    # and ``(margin − credit_received)`` for short credit spreads / iron
+    # condors. Without this, a freshly opened F&O credit-spread reports a
+    # phantom -2-3 % "loss" (the margin block) the moment it opens, and
+    # the kill-switch will halt all trading on a non-event. The
+    # ``Executor._publish_state`` snapshot must also include
+    # ``instrument_kind`` and ``margin_blocked`` per position so the
+    # healthcheck and dashboard can apply the same correction.
+    try:
+        from bot.risk import RiskManager
+    except Exception as e:                                       # noqa: BLE001
+        return (Status.FAIL, f"could not import bot.risk: {e}", {"fix": "15"})
+    risk_src = inspect.getsource(RiskManager._equity)
+    if "SPREAD" not in risk_src or "IRON_CONDOR" not in risk_src:
+        return (Status.FAIL,
+                "FIX #15 regressed: RiskManager._equity no longer adjusts "
+                "equity for SPREAD / IRON_CONDOR instrument kinds. Phantom "
+                "margin-block 'loss' will trip the kill-switch on a "
+                "freshly-opened credit spread (the 2026-05-05 PM scenario).",
+                {"fix": "15"})
+    if "margin_blocked" not in risk_src:
+        return (Status.FAIL,
+                "FIX #15 regressed: RiskManager._equity no longer references "
+                "margin_blocked. F&O equity will be undervalued by the "
+                "margin held, and the kill-switch will misfire.",
+                {"fix": "15"})
+    pub_src = inspect.getsource(Executor._publish_state)
+    if "instrument_kind" not in pub_src or "margin_blocked" not in pub_src:
+        return (Status.FAIL,
+                "FIX #15 regressed: Executor._publish_state no longer writes "
+                "instrument_kind / margin_blocked into portfolio:<seg>. The "
+                "healthcheck and dashboard cannot apply the corrected "
+                "equity formula.",
+                {"fix": "15"})
+    # Mirror check on healthcheck.py (the dashboard's other equity reader).
+    try:
+        from bot import healthcheck as _hc_mod
+        hc_src = inspect.getsource(_hc_mod._portfolio_and_risk)
+        if "margin_blocked" not in hc_src or "SPREAD" not in hc_src:
+            return (Status.FAIL,
+                    "FIX #15 regressed: healthcheck._portfolio_and_risk no "
+                    "longer applies the F&O-aware equity correction. The "
+                    "Portfolio & risk gate will FAIL on phantom margin "
+                    "loss when an F&O credit-spread is open.",
+                    {"fix": "15"})
+    except Exception as e:                                       # noqa: BLE001
+        return (Status.FAIL, f"could not import bot.healthcheck: {e}", {"fix": "15"})
+
     return (Status.PASS,
             "FIX #12 (synthetic pricing) + FIX #13 (EOD race + over-sell) + "
-            "FIX #14 (F&O EMA50 pre-warm) pinned",
-            {"checks": len(cases) + 2 + 4 + 2,
-             "fixes_pinned": ["12", "13a", "13b", "14"]})
+            "FIX #14 (F&O EMA50 pre-warm) + FIX #15 (F&O-aware daily-loss) pinned",
+            {"checks": len(cases) + 2 + 4 + 2 + 4,
+             "fixes_pinned": ["12", "13a", "13b", "14", "15"]})
 
 
 # ─── Phase 3 (Decision checkers) — read post-maker state ────────────────────
