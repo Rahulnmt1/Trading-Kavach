@@ -1475,6 +1475,93 @@ def main() -> int:
     cache.delete("paper:state:equity")
 
     # ─────────────────────────────────────────────────────────────────────
+    banner("FIX #15 — daily-loss formula excludes margin block (2026-05-05 PM kill-switch trip)")
+    # On 2026-05-05 13:26 the F&O bot opened two NIFTY/BANKNIFTY put
+    # credit-spreads. The dashboard immediately reported
+    # ``daily_pnl_pct = -2.252%``. The kill-switch threshold is -2.0%,
+    # so the bot was 0.252 pp from halting all further trading even
+    # though no money had actually been lost — the "loss" was purely
+    # the margin block (₹10,868) net of premium received (₹8,628).
+    #
+    # Root cause: ``RiskManager._equity`` was a Phase-1 equity-only
+    # formula (cash + long_cost_basis + unrealized) that ignored
+    # ``margin_blocked``. The fix adds the F&O-aware offset:
+    # ``+ margin`` for futures, ``+ (margin − credit)`` for short
+    # credit spreads / iron-condors. ``Executor._publish_state`` now
+    # also writes ``instrument_kind`` / ``margin_blocked`` per-position
+    # so the healthcheck and dashboard apply the same correction.
+    cache.delete("paper:state:fno")
+    fno_broker = PaperBroker(segment=Segment.FNO)
+    starting = fno_broker.cash()  # always config-driven (₹100k)
+
+    # Build a RiskManager and snapshot the starting equity BEFORE entries.
+    fno_risk = RiskManager(fno_broker, segment=Segment.FNO)
+    eq_before = fno_risk._equity()
+    if abs(eq_before - starting) > 1.0:
+        print(f"  ✗ FAILED — empty F&O book equity should equal cash; got "
+              f"₹{eq_before:,.2f} vs cash ₹{starting:,.2f}")
+        return 1
+
+    # Reproduce the May-05 13:26 entries.
+    from bot.broker.base import Order, OrderSide, OrderType, InstrumentKind
+    import uuid as _uuid
+    fno_broker.update_marks({"NIFTY26MAY24050-23950PESPRD": 44.36})
+    fno_broker.place_order(Order(
+        id=str(_uuid.uuid4()),
+        symbol="NIFTY26MAY24050-23950PESPRD", side=OrderSide.SELL, qty=75,
+        type=OrderType.MARKET, price=44.36,
+        instrument_kind=InstrumentKind.SPREAD, lot_size=75,
+    ))
+    fno_broker.update_marks({"BANKNIFTY26MAY54700-54600PESPRD": 44.18})
+    fno_broker.place_order(Order(
+        id=str(_uuid.uuid4()),
+        symbol="BANKNIFTY26MAY54700-54600PESPRD", side=OrderSide.SELL, qty=120,
+        type=OrderType.MARKET, price=44.18,
+        instrument_kind=InstrumentKind.SPREAD, lot_size=30,
+    ))
+    eq_after = fno_risk._equity()
+    pnl_pct_open = (eq_after - eq_before) / eq_before * 100
+    if pnl_pct_open < -0.5:
+        print(f"  ✗ FAILED — flat-mark spreads produce phantom loss of "
+              f"{pnl_pct_open:.3f}% (entry-fee budget is ~-0.10%). "
+              f"This is the exact 2026-05-05 PM kill-switch-trip signature.")
+        return 1
+    print(f"  ✓ Flat-mark credit spreads report {pnl_pct_open:+.3f}% (only entry fees, no phantom margin loss)")
+
+    # Adverse mark move must produce genuine MTM loss.
+    fno_broker.update_marks({"NIFTY26MAY24050-23950PESPRD": 50.0})
+    fno_broker.positions()  # triggers unrealized recompute
+    eq_adverse = fno_risk._equity()
+    pnl_pct_adverse = (eq_adverse - eq_before) / eq_before * 100
+    if pnl_pct_adverse > pnl_pct_open - 0.3:
+        print(f"  ✗ FAILED — ₹5.64 adverse mark move on a 75-lot short produced "
+              f"only {pnl_pct_adverse - pnl_pct_open:.3f}% additional loss "
+              f"(should be ~-0.42% from the (44.36-50.00)*75 = -₹423 unrealized).")
+        return 1
+    print(f"  ✓ Genuine MTM loss correctly captured ({pnl_pct_adverse:+.3f}% after ₹5.64 adverse mark)")
+
+    # Source-pin: confirm RiskManager._equity references SPREAD/IRON_CONDOR
+    # and the executor snapshot includes the F&O fields. Future refactors
+    # that drop this re-introduce the kill-switch trip.
+    risk_src = inspect.getsource(RiskManager._equity)
+    if "SPREAD" not in risk_src or "IRON_CONDOR" not in risk_src or "margin_blocked" not in risk_src:
+        print(f"  ✗ FAILED — RiskManager._equity no longer adjusts equity for "
+              f"credit spreads / iron-condors / margin_blocked. Phantom margin loss can recur.")
+        return 1
+    print(f"  ✓ RiskManager._equity source pinned (SPREAD/IRON_CONDOR/margin_blocked references present)")
+    from bot.executor import Executor as _Exec
+    pub_src = inspect.getsource(_Exec._publish_state)
+    if "instrument_kind" not in pub_src or "margin_blocked" not in pub_src:
+        print(f"  ✗ FAILED — Executor._publish_state no longer writes instrument_kind / "
+              f"margin_blocked into the portfolio snapshot. The dashboard and "
+              f"healthcheck cannot apply the corrected equity formula.")
+        return 1
+    print(f"  ✓ Executor._publish_state writes instrument_kind + margin_blocked per position")
+
+    # Cleanup.
+    cache.delete("paper:state:fno")
+
+    # ─────────────────────────────────────────────────────────────────────
     banner("FIX #14 — F&O EMA50 pre-warm (2026-05-04 zero-F&O-trades incident)")
     # On 2026-05-04 the F&O bot produced ZERO trades despite NIFTY having
     # two clean EMA20/EMA50 crosses (09:20 BULL, 12:20 BEAR) and BANKNIFTY

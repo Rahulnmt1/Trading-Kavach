@@ -163,6 +163,39 @@ class TeeLogger:
 
 # ─── Phase 1 (Checkers) — system & process sanity ───────────────────────────
 
+def check_power_source() -> tuple[str, str, dict]:
+    """Warn (non-blocking) if the Mac is on battery power.
+
+    On 2026-05-05 the Mac entered standby between 07:30 and 09:46 IST
+    while the bot was supposedly held awake by ``caffeinate -i -m -s``.
+    The ``-s`` flag is ignored on battery, and ``-i`` does not prevent
+    macOS standby. The bot threads were silently frozen for 2 h 10 m,
+    which delayed the watchlist update, the research run, and the F&O
+    bot's recovery.
+
+    On battery → WARN with the exact pmset workaround. On AC → PASS.
+    Non-darwin or pmset unavailable → SKIP.
+    """
+    try:
+        from bot.power import power_state
+    except Exception as e:                                       # noqa: BLE001
+        return (Status.SKIP, f"bot.power unavailable: {e}", {})
+    source, pct = power_state()
+    if source == "ac":
+        suffix = f" ({pct}%)" if pct is not None else ""
+        return (Status.PASS, f"on AC power{suffix} — sleep prevention is fully effective", {"source": source, "pct": pct})
+    if source == "battery":
+        suffix = f" ({pct}%)" if pct is not None else ""
+        return (Status.WARN,
+                f"running on BATTERY{suffix} — caffeinate alone won't prevent macOS standby. "
+                "Plug in to AC, or run: sudo pmset -b sleep 0 disablesleep 1 "
+                "(restore later with: sudo pmset -b sleep 1 disablesleep 0). "
+                "This was the root cause of the 2026-05-05 morning blackout.",
+                {"source": source, "pct": pct,
+                 "remediation": "sudo pmset -b sleep 0 disablesleep 1"})
+    return (Status.SKIP, "power state unknown (non-darwin or pmset unavailable)", {"source": source})
+
+
 def check_python_venv() -> tuple[str, str, dict]:
     """Are we running inside the project's venv?"""
     in_venv = (hasattr(sys, "real_prefix")
@@ -780,6 +813,7 @@ def build_steps() -> list[Step]:
     return [
         # ── Phase 1: cheap checkers (no I/O outside local fs / ps) ──────
         Step("python_venv",         "checker", critical=False, fn=check_python_venv),
+        Step("power_source",        "checker", critical=False, fn=check_power_source),
         Step("disk_space",          "checker", critical=True,  fn=check_disk_space),
         Step("logs_writable",       "checker", critical=True,  fn=check_logs_writable),
         Step("no_stale_processes",  "checker", critical=False, fn=check_no_stale_bot_processes),

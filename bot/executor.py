@@ -706,6 +706,17 @@ class Executor:
                     "take_profit": p.take_profit,
                     "unrealized_pnl": p.unrealized_pnl,
                     "realized_pnl": p.realized_pnl,
+                    # FIX 2026-05-05 PM: include the F&O fields so the
+                    # healthcheck and dashboard can apply the corrected
+                    # equity formula (which adds margin_blocked back for
+                    # futures, and (margin − credit) for short credit
+                    # spreads / iron-condors). Without these the snapshot
+                    # consumers would re-introduce the phantom margin-block
+                    # loss the risk-manager itself just patched.
+                    "instrument_kind": getattr(p, "instrument_kind", None).value
+                        if getattr(p, "instrument_kind", None) is not None else "EQUITY",
+                    "margin_blocked": float(getattr(p, "margin_blocked", 0.0) or 0.0),
+                    "lot_size": int(getattr(p, "lot_size", 1) or 1),
                 }
                 for p in positions
             ],

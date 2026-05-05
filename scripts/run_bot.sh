@@ -10,10 +10,26 @@
 # in the first place).
 #
 # `caffeinate` flags used:
-#   -i  prevent idle-sleep   (the most important one for a long-running tick)
-#   -m  prevent disk-sleep   (Redis / file logging stay responsive)
+#   -d  prevent display-sleep   (extra reinforcement; display dims still OK)
+#   -i  prevent idle-sleep      (the most important one for a long-running tick)
+#   -m  prevent disk-sleep      (Redis / file logging stay responsive)
 #   -s  prevent system-sleep when on AC power (laptop shut lid → still runs)
+#   -u  declare user-active     (creates an additional UserIsActive assertion;
+#                                 reinforces -i on battery and during long idle
+#                                 windows where the system would otherwise enter
+#                                 standby. Persists for the lifetime of the
+#                                 utility/-w pid, not the default 5s timeout.)
 #   -w PID  caffeinate exits when the bot exits — Mac can sleep again
+#
+# NOTE: even with all five flags above, macOS *standby* (deep sleep after
+# standbydelaylow / standbydelayhigh seconds) can still pause Python
+# threads — exactly what happened on 2026-05-05 between 07:30 and 09:46
+# IST. The only fully reliable fix on battery is:
+#
+#     sudo pmset -b sleep 0 disablesleep 1
+#
+# which requires user consent (sudo). The bot will print a startup
+# warning if it detects it is starting on battery.
 #
 # Usage:
 #   bash scripts/run_bot.sh                                  # defaults: run --paper --segment equity
@@ -59,7 +75,7 @@ BOT_PID=$!
 # Forward signals so Ctrl+C reaches the bot, not just caffeinate.
 trap 'kill -TERM "$BOT_PID" 2>/dev/null || true' INT TERM
 
-caffeinate -i -m -s -w "$BOT_PID" &
+caffeinate -d -i -m -s -u -w "$BOT_PID" &
 CAFF_PID=$!
 
 wait "$BOT_PID"

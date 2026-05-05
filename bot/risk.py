@@ -14,7 +14,7 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from .broker.base import Broker
+from .broker.base import Broker, InstrumentKind
 from .config import PROJECT_ROOT, load_config
 from .logger import logger
 from .segment import Segment, cfg_capital, cfg_risk
@@ -52,24 +52,59 @@ class RiskManager:
             logger.info("[risk:{}] new day {}, counters reset", self.segment.value, today)
 
     def _equity(self) -> float:
-        """Total account equity = cash + market value of held positions.
+        """Total account equity = cash + economic value of held positions.
 
-        The paper broker debits cash by the full cost on a BUY (so cash drops by
-        ``qty * avg_price + fees``) but only by fees on a short SELL (sale
-        proceeds are not credited — broker simplification). The position's
-        ``unrealized_pnl`` is the *change* since entry, NOT the position's
-        market value, so we must add back the long cost basis explicitly to
-        avoid a phantom 24%-of-capital "loss" the moment we open a position.
+        The paper broker uses different cash-flow models depending on
+        ``InstrumentKind``. The equity formula must account for each so a
+        position never produces a phantom P&L the moment it opens:
 
-        Equity, correctly: cash + Σ(long cost basis) + Σ(unrealized P&L on all
-        positions). Shorts contribute only via unrealized P&L because the
-        paper broker never credited their sale proceeds.
+        * **Long equity / long option BUY** — cash debited by full notional
+          (``qty * avg_price + fees``). Position contributes
+          ``avg_price * qty`` (cost basis, recovers at close) plus the
+          mark-to-market drift in ``unrealized_pnl``.
+        * **Equity short SELL** — paper broker simplification: cash is
+          debited by entry fees only (no proceeds credited). Position
+          contributes only ``unrealized_pnl``.
+        * **Futures (long or short)** — cash debited by ``margin_blocked``
+          + fees; position holds the margin and refunds it at close.
+          Position contributes ``margin_blocked + unrealized_pnl``.
+        * **Credit spread / iron-condor (short)** — cash flow at entry
+          is ``+credit_received - margin_blocked - fees``: the broker
+          banks the credit and locks the margin. Position contributes
+          ``margin_blocked - credit_received + unrealized_pnl``: at
+          close, margin refunds, the credit is "spent" buying back the
+          spread, and unrealized captures the mark drift.
+
+        ── Why this matters (the 2026-05-05 PM kill-switch trip) ─────────
+        The original formula was ``cash + long_cost_basis + unrealized``,
+        written for a Phase-1 equity-only book. On 2026-05-05 the F&O
+        bot opened two NIFTY/BANKNIFTY put credit-spreads at 13:26 and
+        the dashboard immediately reported ``daily_pnl_pct = -2.252%`` —
+        purely the margin block (₹10,868) net of premium collected
+        (₹8,628), which is *not* economic loss. The kill-switch
+        threshold is ``-2.0%``, so the bot was 0.252 percentage-points
+        from halting all further trading on a non-event. This formula
+        now adds the credit-spread / IC offset (margin − credit) so a
+        flat-mark spread reports ~0% P&L, with kill-switch reserved
+        for actual mark-to-market loss.
         """
         cash = self.broker.cash()
         positions = self.broker.positions()
         long_cost_basis = sum(p.avg_price * p.qty for p in positions if p.qty > 0)
         unrealized = sum(p.unrealized_pnl for p in positions)
-        return cash + long_cost_basis + unrealized
+
+        margin_offset = 0.0
+        for p in positions:
+            kind = getattr(p, "instrument_kind", InstrumentKind.EQUITY)
+            margin = float(getattr(p, "margin_blocked", 0.0) or 0.0)
+            if kind == InstrumentKind.FUTURES:
+                margin_offset += margin
+            elif kind in (InstrumentKind.SPREAD, InstrumentKind.IRON_CONDOR):
+                if p.qty < 0:
+                    credit_received = p.avg_price * abs(p.qty)
+                    margin_offset += margin - credit_received
+
+        return cash + long_cost_basis + unrealized + margin_offset
 
     def _daily_pnl_pct(self) -> float:
         if self._starting_equity is None:

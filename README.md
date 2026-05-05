@@ -1708,9 +1708,11 @@ bash scripts/run_bot.sh                 # paper mode
 bash scripts/run_bot.sh run --paper     # explicit
 ```
 
-The script runs `caffeinate -i -m -s -w <bot_pid>` alongside the bot, so the
-sleep lock is released the instant you Ctrl+C. No admin password needed; no
-state to remember to undo.
+The script runs `caffeinate -d -i -m -s -u -w <bot_pid>` alongside the bot, so
+the sleep lock is released the instant you Ctrl+C. No admin password needed;
+no state to remember to undo. The `-u` (UserIsActive) and `-d` (display)
+assertions reinforce `-i` on battery and during long idle windows; the `-s`
+flag is a no-op on battery but harmless.
 
 To verify it's working in another terminal:
 
@@ -1718,6 +1720,37 @@ To verify it's working in another terminal:
 pmset -g assertions | grep -E 'PreventUserIdleSystemSleep|PreventDiskIdle'
 # you should see two lines naming the caffeinate process; before launch, none.
 ```
+
+### Layer 1.5 — Battery-mode pmset override (the 2026-05-05 lesson)
+
+`caffeinate` is **not** sufficient when the laptop is on battery. The flags
+above hold `PreventUserIdleSystemSleep` even on battery, but macOS *standby*
+(deep sleep after `standbydelaylow` seconds) and clamshell-mode sleep with
+the lid closed both bypass `caffeinate`. On 2026-05-05 the bot was frozen
+between 07:30 and 09:46 IST by exactly this — pre-market jobs silently
+skipped, F&O bot's tick loop hung.
+
+The bot now prints a loud yellow warning at startup if it detects battery
+operation, and the preflight (`scripts/premarket_preflight.py`) reports a
+WARN for the same condition. To fix the underlying issue, choose one:
+
+**A. Plug into AC.** Simplest, no admin needed. With AC, `caffeinate -s`
+becomes effective and standby is suppressed.
+
+**B. Override pmset on battery (one-time, requires sudo).**
+```bash
+# Disable battery sleep entirely.
+sudo pmset -b sleep 0 disablesleep 1
+
+# Verify (look for "sleep 0" and "disablesleep 1" under "Battery Power").
+pmset -g custom
+
+# Restore later when you want the laptop to sleep normally on battery.
+sudo pmset -b sleep 1 disablesleep 0
+```
+
+The bot's startup warning includes these exact commands so the operator
+can copy-paste without leaving the terminal.
 
 ### Layer 2 — `pmset` morning wake schedule (handles overnight lid-closed)
 

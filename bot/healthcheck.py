@@ -490,7 +490,23 @@ def _portfolio_and_risk(segment: Segment = Segment.EQUITY) -> CheckResult:
     long_basis = sum((p.get("avg_price", 0) or 0) * (p.get("qty", 0) or 0)
                      for p in positions if (p.get("qty", 0) or 0) > 0)
     unreal = sum(p.get("unrealized_pnl", 0) or 0 for p in positions)
-    equity = cash + long_basis + unreal
+    # Mirror RiskManager._equity (FIX 2026-05-05 PM): for futures
+    # positions add back margin_blocked; for short credit spreads / ICs
+    # add (margin_blocked − credit_received). Without this, a freshly
+    # opened F&O credit-spread reports a phantom −2-3% loss the moment
+    # it opens — purely the margin block — and tomorrow's healthcheck
+    # would FAIL the Portfolio & risk gate on a non-event.
+    margin_offset = 0.0
+    for p in positions:
+        kind = (p.get("instrument_kind") or "EQUITY").upper()
+        margin = float(p.get("margin_blocked", 0) or 0)
+        qty = p.get("qty", 0) or 0
+        if kind == "FUTURES":
+            margin_offset += margin
+        elif kind in ("SPREAD", "IRON_CONDOR") and qty < 0:
+            credit_received = (p.get("avg_price", 0) or 0) * abs(qty)
+            margin_offset += margin - credit_received
+    equity = cash + long_basis + unreal + margin_offset
     pnl_pct = (equity - capital_total) / capital_total * 100 if capital_total else 0
     detail = (
         f"equity ₹{equity:,.0f} ({pnl_pct:+.2f}%), "

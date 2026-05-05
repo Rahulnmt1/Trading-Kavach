@@ -93,6 +93,13 @@ def run(
         console.print(f"[red bold]{e}[/red bold]")
         raise typer.Exit(code=1)
 
+    # Warn loudly if starting on battery — the 2026-05-05 morning sleep
+    # blackout was caused by exactly this and ``caffeinate -i`` alone is
+    # not sufficient to prevent macOS standby on battery.
+    from bot.power import battery_warning_lines
+    for line in battery_warning_lines():
+        console.print(f"[yellow bold]{line}[/yellow bold]")
+
     if live:
         if not env().LIVE_TRADING:
             console.print("[red]Set LIVE_TRADING=true in .env first. Aborting.[/red]")
