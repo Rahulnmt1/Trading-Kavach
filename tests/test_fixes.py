@@ -1417,6 +1417,63 @@ def main() -> int:
     cache.delete("eod_done:equity")
     cache.delete("paper:state:equity")
 
+    # ── FIX #13a refinement (2026-05-05 PM regression) ──────────────────
+    # The original idempotency guard was too coarse: any defensive sweep
+    # that happened to call `_end_of_day` (startup_catchup after a midday
+    # restart, SIGTERM shutdown handler) would write the eod_done marker
+    # even on a flat book. On 2026-05-05 this poisoned the marker at
+    # 10:13:59 IST after a Mac-sleep recovery — the legitimate 15:15
+    # cron square-off was then blocked, and two open F&O credit-spreads
+    # carried overnight against the bot's intraday-only mandate.
+    #
+    # The refined guard exposes a `mark_done` keyword argument: scheduled
+    # paths (15:15 cron, in-window tick) leave it True (default) and
+    # cooperate with the May-04 race protection; defensive sweeps pass
+    # `mark_done=False` and skip the marker entirely.
+    cache.delete("eod_done:equity")
+    cache.delete("paper:state:equity")
+    eq_broker3 = PaperBroker(segment=Segment.EQUITY)
+    # No positions — empty book, exactly the May-05 startup-catchup state.
+    fake3 = _FakeExecutor(eq_broker3)
+    Executor._end_of_day(fake3, mark_done=False)
+    marker_after_defensive = cache.get_json("eod_done:equity")
+    if marker_after_defensive is not None:
+        print(f"  ✗ FAILED — defensive sweep (mark_done=False) on flat book "
+              f"wrote the eod_done marker — this is the 2026-05-05 PM bug.")
+        print(f"    marker: {marker_after_defensive}")
+        return 1
+    print(f"  ✓ Defensive sweep on flat book leaves eod_done UNSET (mark_done=False)")
+
+    # Now a legitimate 15:15 path runs — should still set the marker
+    # (race protection for the May-04 scenario must still work).
+    Executor._end_of_day(fake3)  # default mark_done=True
+    marker_after_scheduled = cache.get_json("eod_done:equity")
+    if not marker_after_scheduled or marker_after_scheduled.get("date") != datetime.now(IST).date().isoformat():
+        print(f"  ✗ FAILED — scheduled path (mark_done=True) did NOT set marker")
+        print(f"    marker: {marker_after_scheduled}")
+        return 1
+    print(f"  ✓ Scheduled path (mark_done=True) still writes marker (May-04 race protection intact)")
+
+    # Pin the wiring: scheduler's _shutdown and _startup_catchup must
+    # both pass `mark_done=False`. A future refactor that drops the
+    # kwarg silently re-introduces today's bug.
+    import inspect as _inspect
+    from bot import scheduler as _sched_mod
+    sched_src = _inspect.getsource(_sched_mod)
+    if "mark_done=False" not in sched_src:
+        print(f"  ✗ FAILED — bot/scheduler.py does not pass mark_done=False from "
+              f"any defensive caller. Today's regression can recur.")
+        return 1
+    if sched_src.count("mark_done=False") < 2:
+        print(f"  ✗ FAILED — expected mark_done=False in BOTH _startup_catchup "
+              f"and _shutdown (saw {sched_src.count('mark_done=False')} occurrence(s)).")
+        return 1
+    print(f"  ✓ _startup_catchup and _shutdown both opt out via mark_done=False")
+
+    # Cleanup.
+    cache.delete("eod_done:equity")
+    cache.delete("paper:state:equity")
+
     # ─────────────────────────────────────────────────────────────────────
     banner("FIX #14 — F&O EMA50 pre-warm (2026-05-04 zero-F&O-trades incident)")
     # On 2026-05-04 the F&O bot produced ZERO trades despite NIFTY having

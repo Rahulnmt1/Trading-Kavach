@@ -210,7 +210,11 @@ def start(segment: Segment = Segment.EQUITY) -> None:
     def _shutdown(*_):
         logger.warning("[{}] Shutdown signal received — squaring off and exiting.", segment.value)
         try:
-            executor._end_of_day()
+            # mark_done=False: SIGTERM is a defensive sweep, not the
+            # scheduled 15:15 EOD. Setting the eod_done marker here
+            # would poison the rest of the day if the bot is restarted
+            # mid-session — exactly the 2026-05-05 PM regression.
+            executor._end_of_day(mark_done=False)
             try:
                 write_eod_report(segment=segment)
             except Exception as e:
@@ -245,7 +249,13 @@ def _startup_catchup(executor: Executor, cfg, segment: Segment = Segment.EQUITY)
             segment.value, now.strftime("%H:%M:%S"), cfg.session.square_off,
             len(open_positions),
         )
-        executor._end_of_day()
+        # mark_done=False: defensive recovery sweep, not the legitimate
+        # 15:15 cron path. On 2026-05-05 the bot restarted at 10:13
+        # after a Mac-sleep blackout; this branch ran on an empty book
+        # and used to set the eod_done marker, which then blocked the
+        # legitimate 15:15 square-off when real F&O positions opened
+        # at 13:26. The marker is now reserved for scheduled paths.
+        executor._end_of_day(mark_done=False)
     try:
         write_eod_report(segment=segment)
     except Exception as e:

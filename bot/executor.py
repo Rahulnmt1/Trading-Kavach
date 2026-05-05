@@ -571,8 +571,8 @@ class Executor:
                 "strategy": sig.strategy, "reason": sig.reason,
             })
 
-    def _end_of_day(self) -> None:
-        # ── Idempotency guard ────────────────────────────────────────────
+    def _end_of_day(self, *, mark_done: bool = True) -> None:
+        # ── Idempotency guard (FIX #13a, refined 2026-05-05 PM) ──────────
         #
         # The 2026-05-04 ADANIENT incident (-₹24,887 phantom short) was
         # caused by `_end_of_day` running TWICE at 15:15:00 — once from
@@ -587,16 +587,39 @@ class Executor:
         # instance attribute) so even a process restart between concurrent
         # calls would still be guarded. TTL of 2 days makes the key
         # self-clean over weekends without requiring an explicit reset.
+        #
+        # ── Why ``mark_done`` exists (the 2026-05-05 PM regression) ──────
+        # The original guard above was too coarse: it set the marker on
+        # ANY call, including the defensive "startup_catchup" sweep that
+        # runs after a midday restart on a flat book. On 2026-05-05 the
+        # bot restarted at 10:13:59 IST after a Mac-sleep blackout, the
+        # startup sweep called `_end_of_day` on an empty book (no-op) but
+        # still wrote `eod_done:{seg}:date=today` — POISONING the marker
+        # for the rest of the day. When real F&O credit-spreads opened
+        # at 13:26 and the LEGITIMATE 15:15 cron fired its scheduled
+        # square-off, every call was rejected by this same guard. Two
+        # short put-spreads carried overnight against the bot's
+        # intraday-only mandate.
+        #
+        # The fix: only the *scheduled* paths (the 15:15 `end_of_day`
+        # cron and the per-minute `executor.tick` once `should_square_off`
+        # is true) check + set the marker — they are the calls the May-04
+        # race-condition guard actually needs to coordinate. Defensive
+        # sweeps (`_startup_catchup`, `_shutdown` SIGTERM handler) pass
+        # ``mark_done=False`` so they still flatten any open positions
+        # but neither read nor write the marker, and so cannot poison
+        # the legitimate 15:15 path.
         today = datetime.now(IST).date().isoformat()
         eod_key = f"eod_done:{self.segment.value}"
-        prev = self.cache.get_json(eod_key)
-        if isinstance(prev, dict) and prev.get("date") == today:
-            logger.warning(
-                "[{}] _end_of_day already ran today at {} — skipping "
-                "duplicate call (this is the 2026-05-04 race-condition "
-                "guard).", self.segment.value, prev.get("ts", "?"),
-            )
-            return
+        if mark_done:
+            prev = self.cache.get_json(eod_key)
+            if isinstance(prev, dict) and prev.get("date") == today:
+                logger.warning(
+                    "[{}] _end_of_day already ran today at {} — skipping "
+                    "duplicate call (this is the 2026-05-04 race-condition "
+                    "guard).", self.segment.value, prev.get("ts", "?"),
+                )
+                return
 
         positions = self.broker.positions()
         if not positions:
@@ -605,10 +628,15 @@ class Executor:
             # still create phantom shorts via the broker's no-existing
             # path. The mark is the defence; the over-sell guard in the
             # broker is the second-line defence.
-            self.cache.set_json(eod_key, {
-                "date": today, "ts": datetime.now(IST).isoformat(),
-                "closed": 0,
-            }, ttl=86400 * 2)
+            #
+            # BUT only when `mark_done=True` — defensive sweeps from
+            # startup/shutdown explicitly opt out of writing the marker
+            # (see 2026-05-05 PM regression note above).
+            if mark_done:
+                self.cache.set_json(eod_key, {
+                    "date": today, "ts": datetime.now(IST).isoformat(),
+                    "closed": 0,
+                }, ttl=86400 * 2)
             return
         logger.warning("[{}] Square-off time — closing {} open position(s)",
                        self.segment.value, len(positions))
@@ -648,10 +676,16 @@ class Executor:
         # next tick can retry. The duplicate-guard at the top of this
         # method is what protects against the cron-race; this mark is
         # the "successfully completed" stamp.
-        self.cache.set_json(eod_key, {
-            "date": today, "ts": datetime.now(IST).isoformat(),
-            "closed": len([o for o in closed if o.status == OrderStatus.FILLED]),
-        }, ttl=86400 * 2)
+        #
+        # Defensive sweeps (mark_done=False) close positions but skip
+        # the marker write — they must not foreclose the scheduled
+        # 15:15 path's ability to run later (see 2026-05-05 PM
+        # regression note at the top of this method).
+        if mark_done:
+            self.cache.set_json(eod_key, {
+                "date": today, "ts": datetime.now(IST).isoformat(),
+                "closed": len([o for o in closed if o.status == OrderStatus.FILLED]),
+            }, ttl=86400 * 2)
         self._publish_state()
 
     def _publish_state(self) -> None:

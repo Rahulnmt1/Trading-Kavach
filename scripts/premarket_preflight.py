@@ -625,6 +625,30 @@ def maker_run_regression_suite() -> tuple[str, str, dict]:
                 "write at bottom to claim the day). Asymmetric impl detected.",
                 {"fix": "13a"})
 
+    # FIX #13a refinement (2026-05-05 PM): the marker check + write must
+    # be gated on `mark_done`. Defensive sweeps from `_startup_catchup`
+    # and `_shutdown` must opt out by passing `mark_done=False` so they
+    # cannot poison the marker for the rest of the day. This was the
+    # 2026-05-05 regression: a 10:13 startup sweep on a flat book set
+    # the marker, blocking the legitimate 15:15 square-off when real
+    # F&O positions opened at 13:26.
+    if "mark_done" not in eod_src:
+        return (Status.FAIL,
+                "FIX #13a refinement regressed: executor._end_of_day no "
+                "longer accepts the `mark_done` kwarg. Defensive sweeps "
+                "(startup_catchup, SIGTERM) will poison the marker again "
+                "— exact 2026-05-05 PM signature.",
+                {"fix": "13a-refined"})
+    sched_src_text = inspect.getsource(__import__("bot.scheduler", fromlist=["scheduler"]))
+    if sched_src_text.count("mark_done=False") < 2:
+        return (Status.FAIL,
+                "FIX #13a refinement regressed: bot/scheduler.py expected "
+                "to pass `mark_done=False` from BOTH _startup_catchup and "
+                f"_shutdown (saw {sched_src_text.count('mark_done=False')} occurrence(s)). "
+                "Without this, a midday restart's defensive sweep poisons "
+                "the eod_done marker and blocks the 15:15 square-off.",
+                {"fix": "13a-refined"})
+
     # ── FIX #13 — equity over-sell guard (refined 2026-05-05) ───────────
     # The guard MUST still reject the precise 2026-05-04 phantom-short
     # signature (is_squareoff orphan SELL on a flat book), AND the
