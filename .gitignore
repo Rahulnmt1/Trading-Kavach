@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.DS_Store
+.pytest_cache/
+.ipynb_checkpoints/
+data/
+logs/
+*.log
+*.db
+.idea/
+.vscode/
+# Runtime singleton lock files (PID-stamped by bot.lock on startup,
+# released on shutdown) — segment-specific, must never be checked in
+# or pushed since they reflect the local machine's bot processes.
+.bot.lock.*

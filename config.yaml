@@ -1,0 +1,312 @@
+# =================================================================
+# Stock Market Bot - Trading Configuration
+# =================================================================
+# All risk parameters are intentionally conservative. Adjust ONLY
+# after backtesting and a 2-week paper-trading run with no losses.
+# =================================================================
+
+capital:
+  total: 100000           # Total equity trading capital in INR
+  deployable_pct: 0.80    # Use at most 80% of capital at any time
+
+risk:
+  max_daily_loss_pct: 2.0       # Halt all trading if day's loss >= 2% of capital
+  max_loss_per_trade_pct: 1.0   # Stop-loss sized so max loss per trade <= 1%
+  # Hard cap on TOTAL trades per day. NOTE: this is a frequency lever, NOT
+  # a risk lever — each trade is still bounded by `max_loss_per_trade_pct`
+  # and the day's cumulative loss is still hard-capped at `max_daily_loss_pct`
+  # (2 %). Raising this lets the bot keep trading after the first 5 round-
+  # trips so total daily P&L can scale up. Even if all 10 trades lose, the
+  # 2 % daily-loss cap halts trading well before the count is reached.
+  max_trades_per_day: 10
+  max_open_positions: 3         # Cannot hold more than this many open positions
+  max_position_pct: 25.0        # No single position larger than 25% of capital
+  reward_risk_ratio: 1.5        # Target gain = 1.5 * stop-loss distance
+  trailing_stop: true           # Once +1R is reached, trail SL with ATR
+  # ATR-based stop-loss / take-profit (applies to ALL strategies uniformly).
+  # SL distance = sl_atr_mult * ATR(14)  on the bar's timeframe (5m).
+  # TP distance = tp_atr_mult * ATR(14)  — i.e. reward = 1.5R by default.
+  # Tighter than the strategy-native SLs, so trades resolve intraday instead
+  # of being closed by the EOD square-off most of the time.
+  sl_atr_mult: 1.0
+  tp_atr_mult: 1.5
+  # ── Trailing stop tuning (only used if trailing_stop: true) ──
+  # When unrealized profit reaches `trail_activation_r` × R, ratchet the
+  # stop up so we can never lose more than (R − `trail_lock_r` × R) — i.e.
+  # at minimum we lock in `trail_lock_r` × R of profit. From then on the
+  # stop trails at `trail_atr_mult` × ATR below the running peak.
+  trail_activation_r: 1.0       # Activate once price moves +1R in our favour
+  trail_lock_r: 0.5             # Lock in at least 0.5R profit (worst case)
+  trail_atr_mult: 1.0           # After activation, trail at 1×ATR below peak
+  # ── Daily profit lock-in ──
+  # When realised + unrealised P&L for the day reaches this % of capital,
+  # square off everything and stop trading for the day. Critical for hitting
+  # a daily profit objective — without this, profits give back to the EOD
+  # square-off. Set to 0.0 to disable.
+  # On ₹50,000 capital: 5.0 = ₹2,500. On ₹1,00,000: 5.0 = ₹5,000.
+  daily_profit_target_pct: 5.0
+
+session:
+  market_open: "09:15"
+  trade_start: "09:30"          # Skip first 15 mins (avoid opening volatility)
+  # Tightened 2026-05-04 from 14:45 → 13:30. The ADANIENT trade that day
+  # entered at 14:14 with only 60 min runway before the forced 15:15
+  # square-off and lost ₹151.57 because the +0.57% TP couldn't be hit
+  # in time. 13:30 cutoff gives every entry ≥105 min runway — enough
+  # for typical hourly volatility (0.3-0.5%) to reach TP. Reduces trade
+  # count slightly but materially improves expected value per trade
+  # (no per-trade risk change — this is a timing discipline parameter,
+  # not a risk lever).
+  trade_cutoff: "13:30"         # No NEW positions after this time
+  square_off: "15:15"           # Force-close all positions at this time
+  timezone: "Asia/Kolkata"
+
+watchlist:
+  # NIFTY 50 large-cap, liquid intraday stocks. Format: NSE symbol.
+  symbols:
+    - INFY
+    - BANDHANBNK
+    - COALINDIA
+    - BANKBARODA
+    - HCLTECH
+    - ADANIGREEN
+    - HDFCBANK
+    - GAIL
+    - ADANIPORTS
+    - NESTLEIND
+    - ADANIENT
+    - IOC
+    - INDUSINDBK
+    - SBILIFE
+    - ONGC
+strategies:
+  enabled:
+    - orb
+    - vwap_revert
+    - ema_supertrend
+  ensemble:
+    # Production / accuracy mode: only fire when at least 2 of the 3
+    # strategies agree on direction (and none disagrees). The 1-of-3
+    # paper-test mode that ran on 2026-04-28 has been reverted now that
+    # the order pipeline is verified end-to-end.
+    min_agree: 2
+  multitimeframe:
+    enabled: true               # Wrap each strategy in MTF confirmation
+    base_interval: "5m"         # Fast frame for primary signal
+    confirm_interval: "15m"     # Slower frame must agree (trend filter)
+  orb:
+    range_minutes: 15           # Opening range = first 15 minutes
+    breakout_buffer_pct: 0.05   # Require 0.05% break above/below range
+  vwap_revert:
+    deviation_pct: 0.6          # Enter when price >0.6% from VWAP
+    rsi_overbought: 70
+    rsi_oversold: 30
+  ema_supertrend:
+    ema_fast: 9
+    ema_slow: 21
+    supertrend_period: 10
+    supertrend_multiplier: 3
+
+research:
+  enabled: true
+  run_at: "08:30"               # IST. Pre-market run.
+  # Pick top N picks from the auto-watchlist (15 symbols). The executor
+  # scans these every minute looking for ensemble signals — so doubling
+  # this from 5 → 10 doubles the number of opportunities to find a trade
+  # WITHOUT changing per-trade risk (sizing/SL/TP all unchanged).
+  top_n: 10
+
+watchlist_updater:
+  enabled: true
+  # Moved 2026-05-04 from 08:00 → 08:15 IST so the daily premarket order
+  # is: 08:00 NSE holiday refresh → 08:15 watchlist updater → 08:30
+  # research agent → 08:55 Redis reset → 09:00 fee audit → 09:15 market
+  # open. Each step now runs after its dependencies have refreshed.
+  run_at: "08:15"               # IST. Run after holiday refresh, before research.
+  top_n: 15                     # Maintain a rolling watchlist of N symbols
+  min_avg_volume: 500000        # Liquidity floor (avg shares/day)
+  trend_lookback_days: 20       # SMA20 must slope upwards/downwards
+  momentum_lookback_days: 10    # Recent return window for momentum score
+  # The selected symbols are ALWAYS written back to `watchlist.symbols`
+  # above so that config.yaml remains the single source of truth. This
+  # is mandatory and not toggle-able by design.
+
+execution:
+  order_type: MARKET            # MARKET | LIMIT
+  product: MIS                  # MIS = intraday (auto squared off by broker)
+  slippage_bps: 5               # Assumed slippage for paper trading (basis points)
+  # NOTE: paper-trading starting cash is NOT configured here — it is derived
+  # from `capital.total` above so the YAML stays single-source-of-truth.
+
+feed:
+  use_websocket: true           # Use KiteTicker for live ticks (when broker=zerodha)
+  poll_interval_seconds: 60     # Fallback polling interval when WS unavailable
+
+backtest:
+  walk_forward:
+    enabled: true
+    is_window_days: 60          # In-sample window length (training)
+    oos_window_days: 20         # Out-of-sample window (test)
+    step_days: 20               # Slide forward by this many days
+
+logging:
+  to_file: true
+  dir: logs
+
+# =================================================================
+# F&O (Futures & Options) segment — fully isolated from equity
+# =================================================================
+# This block is the configuration for a SEPARATE bot process that you
+# launch with `python -m cli run --segment fno`. It does NOT share
+# state with the equity bot — different lock file (.bot.lock.fno),
+# different Redis namespace (paper:state:fno, signal:fno:*),
+# different capital budget, different trade journal
+# (logs/trades/fno/...).
+#
+# Phase 1: segment isolation scaffold (DONE).
+# Phase 2: index futures (NIFTY, BANKNIFTY) trading via EMA20/EMA50
+#   crossover (DONE). Margin ~₹91K/lot — needs ≥₹150K capital.
+# Phase 3: directional option buying — long CE on bullish cross, long
+#   PE on bearish cross (DONE). Capital-efficient (max loss = full
+#   premium ~₹11K/lot for NIFTY ATM weekly).
+# Phase 4: vertical credit spreads (DONE). Theta on YOUR side, defined
+#   max-loss = (strike width − net credit), ~₹2-5K margin/lot.
+# Phase 4.5 (CURRENT): iron condors (4-leg neutral defined-risk),
+#   stock options/futures lot table, dashboard Greeks.
+# Phase 5: live Kite option-chain bars + multi-leg real orders +
+#   real SPAN+exposure margin (skeleton in bot/broker/zerodha.py).
+#
+# To run alongside equity:
+#   terminal 1:  python -m cli run --segment equity
+#   terminal 2:  python -m cli run --segment fno
+#
+# CAPITAL REALITY CHECK — pick ONE F&O strategy per process:
+#
+#   Strategy                        Margin / lot      Fits ₹1L?
+#   ---------------------------     -------------     ----------
+#   futures_trend (Phase 2)         ~₹91,875          ✓ tight (1 lot, no headroom)
+#   option_buy_directional (P3)     ₹11,250 (premium) ✓ comfortably (8-9 lots)
+#   credit_spread (Phase 4)         ₹2-5K (defined-risk)  ✓ best fit (20-50 lots possible)
+#   iron_condor (Phase 4.5)         ₹2-5K (defined-risk)  ✓ neutral bias
+#
+# Phase 4 default: credit_spread. Theta is on YOUR side (we sell the
+# spread for credit and profit when it decays). Defined-risk = max_loss
+# = strike_width − net_credit. Margin per lot is just the max_loss,
+# typically ₹2-5K for ATM weekly NIFTY 100-pt verticals.
+#
+# Iron condor (Phase 4.5): the *neutral* analogue of credit_spread.
+# Trades when EMAs CONVERGE (sideways regime) instead of crossing.
+# Margin is the WORST wing's max-loss (NOT the sum of both spreads),
+# making it ~50% more capital-efficient than running put + call
+# spreads side-by-side.
+#
+# Why not run multiple F&O strategies in parallel? The Ensemble voter
+# merges signals — but futures, long-options, and spreads all use
+# DIFFERENT SL/TP scales (24400 spot vs ₹120 premium vs ₹70 net credit).
+# Run ONE per F&O bot process. Multi-strategy needs two `--segment fno`
+# processes with different config files (Phase 5 roadmap).
+fno:
+  enabled: true                # F&O bot runs alongside equity
+  # How many calendar days BEFORE monthly expiry to roll the futures /
+  # option resolver to the NEXT contract. Active futures traders roll
+  # 1-2 days early because the dying contract's liquidity collapses on
+  # expiry day. Default 2 = roll on expiry-week Tuesday. Set to 0 for
+  # legacy behaviour (use the dying contract until expiry-day close).
+  rollover_buffer_days: 2
+  capital:
+    total: 100000              # ₹1L F&O capital — comfortably covers 1 lot of NIFTY/BANKNIFTY futures margin
+    deployable_pct: 0.80
+  risk:
+    max_daily_loss_pct: 2.0
+    max_loss_per_trade_pct: 5.0    # OPTIONS: full premium can be lost; widen
+    max_trades_per_day: 5
+    max_open_positions: 2
+    # For options: caps PREMIUM deployed at this % of capital. 50% means
+    # one option position can use up to half the F&O budget.
+    # For futures: caps margin deployed similarly.
+    max_position_pct: 50.0
+    reward_risk_ratio: 1.5
+    trailing_stop: true
+    sl_atr_mult: 2.0
+    tp_atr_mult: 3.0
+    trail_activation_r: 1.0
+    trail_lock_r: 0.5
+    trail_atr_mult: 1.5
+    daily_profit_target_pct: 5.0
+  watchlist:
+    # Bare underlyings — resolved into futures tradingsymbol (Phase 2)
+    # OR into ATM CE/PE option tradingsymbol at signal time (Phase 3).
+    # FINNIFTY's yfinance coverage is unreliable — disabled here until
+    # live broker bars land in Phase 5.
+    symbols:
+      - NIFTY
+      - BANKNIFTY
+  strategies:
+    # Phase 4.5 default: credit_spread (directional, fires on EMA crosses
+    # — more frequent than iron_condor's EMA-convergence trigger). To
+    # trade something else:
+    #   - iron_condor             (Phase 4.5) — 4-leg neutral defined-risk
+    #                                           fires on EMA convergence
+    #                                           (range-bound regime)
+    #   - option_buy_directional  (Phase 3)   — long CE/PE
+    #   - futures_trend           (Phase 2)   — long/short index futures
+    #                                           (needs fno.capital.total ≥ ₹150K)
+    enabled:
+      - credit_spread
+    ensemble:
+      min_agree: 1             # Single strategy — vote of one is consensus
+    multitimeframe:
+      enabled: false           # Phase 4.5: confirm via 15m EMA trend
+    futures_trend:             # Used only when 'futures_trend' in `enabled`
+      ema_fast: 20
+      ema_slow: 50
+      sl_atr_mult: 2.0
+      tp_atr_mult: 3.0
+      # How many recent bars qualify as a "fresh" EMA cross. 5 bars on the
+      # 5m frame ≈ 25 min of freshness. Bumping to 10 ≈ 50 min lets the
+      # strategy still enter on a cross that printed earlier in the
+      # session — same EMA periods, same SL/TP, just a wider window.
+      cross_lookback_bars: 10
+    option_buy_directional:    # Used only when 'option_buy_directional' in `enabled`
+      ema_fast: 20
+      ema_slow: 50
+      sl_atr_mult: 2.0
+      tp_atr_mult: 3.0
+      cross_lookback_bars: 10  # See futures_trend for explanation
+      iv: 0.15
+      risk_free_rate: 0.07
+      min_sl_premium_pct: 0.30
+    credit_spread:             # Used only when 'credit_spread' in `enabled'
+      ema_fast: 20
+      ema_slow: 50
+      cross_lookback_bars: 10  # See futures_trend for explanation
+      # Strike width in points between short and long legs.
+      #   NIFTY:     50 / 100 / 200   (default 100)
+      #   BANKNIFTY: 200 / 300 / 500  (default 200, override per-symbol later)
+      strike_width: 100
+      iv: 0.15                  # Black-Scholes IV for both legs
+      risk_free_rate: 0.07
+      # TP: lock in 50% of net credit (close when net price has decayed
+      # to half of entry credit). Canonical intraday-credit-spread target.
+      profit_lock_pct: 0.50
+      # SL: cap loss at 70% of structural max_loss (close when net price
+      # has risen by 70% of (width − credit) above entry).
+      sl_max_loss_pct: 0.70
+    iron_condor:               # Used only when 'iron_condor' in `enabled'
+      ema_fast: 20
+      ema_slow: 50
+      # Trend-flatness threshold: |fast − slow| / spot. Below this we
+      # treat the regime as consolidation and fire an iron condor.
+      # 0.30% is mild — equivalent to a ~60-point spread at NIFTY 20K.
+      ema_flat_threshold: 0.0030
+      # Wing widths (protective-leg distances). Asymmetric (e.g.
+      # put_width=100 / call_width=200) expresses a directional skew.
+      put_width: 100
+      call_width: 100
+      # Distance from spot to the SHORT inner legs (the credit-bearing
+      # ones). Larger values = lower credit but wider win zone.
+      wings_distance: 100
+      iv: 0.15
+      risk_free_rate: 0.07
+      profit_lock_pct: 0.50    # Close at 50% of credit decayed (TP)
+      sl_max_loss_pct: 0.70    # Stop at 70% of structural max-loss
