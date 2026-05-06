@@ -44,16 +44,27 @@ import streamlit as st
 
 from bot.cache import get_cache
 from bot.config import env, load_config
-from bot.data import intraday_bars, is_market_open
+from bot.data import intraday_bars, is_market_open, latest_quote
 from bot.fees import position_economics, roundtrip_breakdown
 from bot.holidays import get_holidays, market_status, refresh_holidays
 from bot.indicators import ema, rsi, vwap
+# Hoisted from inline imports inside Greeks / open-position chart helpers —
+# Streamlit re-runs the entire script on every interaction, so even cheap
+# per-render imports add up. These are the bot's own modules, not optional
+# heavy deps; importing them at module top is free.
+from bot.instruments.fno import (
+    parse_iron_condor_tradingsymbol,
+    parse_option_tradingsymbol,
+    parse_spread_tradingsymbol,
+    underlying_from_tradingsymbol,
+)
 from bot.journal import (
     daily_summary,
     eod_report,
     trades_csv,
     trades_jsonl,
 )
+from bot.options.pricing import all_greeks, years_to_expiry
 from bot.segment import (
     Segment,
     cache_key,
@@ -63,6 +74,55 @@ from bot.segment import (
     fno_enabled,
     signal_pattern,
 )
+
+
+# ────────────────────────── cached wrappers ──────────────────────────────────
+# Streamlit re-runs the whole script on every interaction. Without these
+# decorators, EVERY rerun re-fetches yfinance bars, re-walks the JSONL
+# trade journal, and re-parses ``config.yaml`` — burning Redis ops, disk
+# I/O, and yfinance rate-limit budget that the bot also needs.
+#
+# TTLs are picked to align with the bot's data cadence:
+#   * yfinance intraday bars ⇒ 60s (matches ``bot/data.py`` Redis TTL)
+#   * yfinance latest_quote  ⇒ 30s (matches ``bot/data.py`` Redis TTL)
+#   * journal daily_summary  ⇒ 30s (post-fill ledger writes are atomic;
+#                                    sub-30s lag is fine for the dashboard)
+#   * NSE holiday calendar   ⇒ 1h  (refreshes once a day in the bot, but
+#                                   we never want a render-path network
+#                                   call to NSE — the explicit "Refresh"
+#                                   button still bypasses this cache)
+#   * config.yaml            ⇒ 10min via cache_resource (read-only here;
+#                              ``cache_data`` would deep-copy the Pydantic
+#                              model on every retrieval)
+
+@st.cache_resource(ttl=600)
+def _cached_load_config():
+    return load_config()
+
+
+@st.cache_data(ttl=3600)
+def _cached_get_holidays(_unused_bucket: int = 0):
+    """Cached holiday calendar.
+
+    The ``_unused_bucket`` arg lets the explicit Refresh button bust the
+    cache by incrementing ``st.session_state['holidays_bucket']``.
+    """
+    return get_holidays(allow_refresh=False)
+
+
+@st.cache_data(ttl=60)
+def _cached_intraday_bars(symbol: str, interval: str):
+    return intraday_bars(symbol, interval)
+
+
+@st.cache_data(ttl=30)
+def _cached_latest_quote(symbol: str):
+    return latest_quote(symbol)
+
+
+@st.cache_data(ttl=30)
+def _cached_daily_summary(day, segment: Segment):
+    return daily_summary(day, segment=segment)
 
 
 # ── Theming ──────────────────────────────────────────────────────────────────
@@ -303,7 +363,10 @@ def render_market_schedule_compact() -> None:
     Smaller variant of the original full-width panel. Lives inside the
     Overview tab next to picks/signals so it doesn't dominate the page.
     """
-    cal = get_holidays(allow_refresh=True)
+    # Use the cached wrapper (1h TTL) on the render path. The "Refresh"
+    # button below still calls ``refresh_holidays`` directly which makes
+    # the live NSE fetch and re-populates the cache for subsequent renders.
+    cal = _cached_get_holidays()
     today = date.today()
     tomorrow = today + timedelta(days=1)
 
@@ -314,6 +377,7 @@ def render_market_schedule_compact() -> None:
         if h_r.button("Refresh", help="Force a live fetch from NSE",
                       key="refresh_holidays_compact"):
             cal = refresh_holidays()
+            _cached_get_holidays.clear()
             st.success(f"Refreshed: {cal.last_refresh[:19].replace('T', ' ')} IST")
 
         src = {"nse": "🟢 NSE (live)", "bootstrap": "🟡 BOOTSTRAP", "stale": "🟡 STALE"}.get(
@@ -398,13 +462,9 @@ def _render_open_trade_charts(positions: list[dict], pos_econ: list) -> None:
     """
     if not positions:
         return
-    # Lazy-import the F&O parser so equity-only segments don't pay
-    # the cost. ``underlying_from_tradingsymbol`` handles bare equity
-    # symbols, FUT, options, spreads, and iron condors uniformly.
-    try:
-        from bot.instruments.fno import underlying_from_tradingsymbol
-    except Exception:                                            # pragma: no cover
-        underlying_from_tradingsymbol = lambda s: s              # noqa: E731
+    # ``underlying_from_tradingsymbol`` is now hoisted to module top —
+    # handles bare equity symbols, FUT, options, spreads, and iron
+    # condors uniformly.
 
     st.markdown("<div class='section-h'>📉 Live trade charts — track each open position</div>",
                 unsafe_allow_html=True)
@@ -421,9 +481,9 @@ def _render_open_trade_charts(positions: list[dict], pos_econ: list) -> None:
             chart_sym = sym
         is_fno = (chart_sym != sym)
 
-        df = intraday_bars(chart_sym, "5m")
+        df = _cached_intraday_bars(chart_sym, "5m")
         if df.empty:
-            df = intraday_bars(chart_sym, "1m")
+            df = _cached_intraday_bars(chart_sym, "1m")
         if df.empty:
             st.caption(
                 f"  ⚠ {sym} — no bars yet for chart symbol `{chart_sym}` "
@@ -774,7 +834,7 @@ def render_charts_tab(*, segment: Segment, watchlist: list[str], cfg) -> None:
     interval = cc2.selectbox("Interval", ["1m", "5m", "15m"], index=1, key="chart_interval")
     if not sym:
         return
-    df = intraday_bars(sym, interval)
+    df = _cached_intraday_bars(sym, interval)
     if df.empty:
         st.warning("No bars yet for the selected symbol — markets may be closed or "
                    "yfinance may be rate-limiting. The bot will retry on the next tick.")
@@ -821,13 +881,9 @@ def render_greeks_tab(positions: list[dict]) -> None:
         st.info("📭 No F&O positions open. Greeks will populate when an option, "
                 "spread, or iron-condor position is filled.")
         return
-    from bot.instruments.fno import (
-        parse_iron_condor_tradingsymbol,
-        parse_option_tradingsymbol,
-        parse_spread_tradingsymbol,
-    )
-    from bot.options.pricing import all_greeks, years_to_expiry
-    from bot.data import latest_quote
+    # Parsers / pricing / quote are now hoisted to module top — see the
+    # imports block. ``latest_quote`` is wrapped in a 30s cache below so
+    # multiple legs sharing an underlying only fetch the spot once.
 
     DEFAULT_IV = 0.15
     DEFAULT_R  = 0.07
@@ -843,7 +899,7 @@ def render_greeks_tab(positions: list[dict]) -> None:
         if not (ic_meta or sp_meta or opt_meta):
             continue
         underlying = (ic_meta or sp_meta or opt_meta)["underlying"]
-        spot_tick = latest_quote(underlying)
+        spot_tick = _cached_latest_quote(underlying)
         spot = float(spot_tick.ltp) if spot_tick and spot_tick.ltp else None
         if spot is None or spot <= 0:
             continue
@@ -1098,8 +1154,23 @@ st.set_page_config(page_title="Stock Market Bot", layout="wide",
                    page_icon="📈")
 st.markdown(_CSS, unsafe_allow_html=True)
 
-cfg   = load_config()
+cfg   = _cached_load_config()
 cache = get_cache()
+
+# ─────────────────────────── Auto-refresh (meta-refresh) ─────────────────────
+# The bot ticks once per minute. Anything more frequent is wasted Redis
+# ops + journal disk reads + potential yfinance contention. We use a
+# pure HTML meta-refresh tag (no extra deps) — full page reload is fine
+# at this cadence on a local laptop. The pause toggle in the sidebar
+# (rendered below) sets ``st.session_state['autorefresh_paused']``; when
+# True we omit the tag and the page holds steady for reading.
+st.session_state.setdefault("autorefresh_paused", False)
+if not st.session_state["autorefresh_paused"]:
+    _refresh_secs = 60 if is_market_open() else 300
+    st.markdown(
+        f"<meta http-equiv='refresh' content='{_refresh_secs}'>",
+        unsafe_allow_html=True,
+    )
 
 # ─────────────────────────── Sidebar ─────────────────────────────────────────
 st.sidebar.markdown("## 🎛️ Controls")
@@ -1131,8 +1202,8 @@ seg_watchlist = cfg_watchlist_symbols(cfg, seg)
 # matches reality even before any close fires.
 with st.sidebar.container(border=True):
     st.markdown("**Combined P&L (today)**")
-    _eq_summary  = daily_summary(date.today(), segment=Segment.EQUITY)
-    _fno_summary = (daily_summary(date.today(), segment=Segment.FNO)
+    _eq_summary  = _cached_daily_summary(date.today(), Segment.EQUITY)
+    _fno_summary = (_cached_daily_summary(date.today(), Segment.FNO)
                     if fno_enabled(cfg) else {"net_pnl": 0, "trades": 0})
     eq_net  = float(_eq_summary.get("net_pnl", 0)  or 0)
     fno_net = float(_fno_summary.get("net_pnl", 0) or 0)
@@ -1187,7 +1258,16 @@ with st.sidebar.container(border=True):
     if st.button("🔄 Refresh holiday calendar", width="stretch",
                  help="Force a fresh fetch from NSE"):
         cal = refresh_holidays()
+        # Bust the dashboard's holiday cache so subsequent renders see
+        # the freshly-fetched calendar instead of the 1h-cached copy.
+        _cached_get_holidays.clear()
         st.success(f"Refreshed: {cal.last_refresh[:19].replace('T', ' ')} IST")
+    st.session_state["autorefresh_paused"] = st.toggle(
+        "⏸ Pause auto-refresh",
+        value=st.session_state.get("autorefresh_paused", False),
+        help="Hold the page steady while reading a chart. Auto-refresh "
+             "runs every 60s during market hours, 5 min when closed.",
+    )
     st.caption(
         "Health check runs automatically at 09:00 / 11:00 / 13:00 / 15:00 IST. "
         "Manual: `python -m cli healthcheck`."
@@ -1197,7 +1277,7 @@ with st.sidebar.container(border=True):
 st.markdown("# 📈 Indian Stock Market — Bot Dashboard")
 
 mode = "🔴 LIVE" if env().LIVE_TRADING and env().BROKER != "paper" else "🟢 PAPER"
-_today_status = market_status(date.today(), seg, calendar=get_holidays(allow_refresh=True))
+_today_status = market_status(date.today(), seg, calendar=_cached_get_holidays())
 _hb = cache.get_json(cache_key("heartbeat:tick", seg)) or {}
 
 render_header_pills(
@@ -1254,7 +1334,7 @@ cash       = snap.get("cash", seg_capital.total)
 realized   = sum(p.get("realized_pnl", 0)   for p in positions)
 unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
 
-_summary       = daily_summary(segment=seg)
+_summary       = _cached_daily_summary(date.today(), seg)
 _lockin        = cache.get_json(cache_key("profit_lockin", seg)) or {}
 _today_pnl_pct = float(snap.get("daily_pnl_pct", 0.0))
 
