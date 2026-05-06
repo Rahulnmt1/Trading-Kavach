@@ -1331,12 +1331,21 @@ if saved_capital is not None and abs(saved_capital - seg_capital.total) > 0.5:
     )
     snap, positions = {}, []
 cash       = snap.get("cash", seg_capital.total)
-realized   = sum(p.get("realized_pnl", 0)   for p in positions)
 unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
 
 _summary       = _cached_daily_summary(date.today(), seg)
 _lockin        = cache.get_json(cache_key("profit_lockin", seg)) or {}
 _today_pnl_pct = float(snap.get("daily_pnl_pct", 0.0))
+
+# Realized P&L: pull from the trade journal (single source of truth),
+# NOT from open positions. Once a position closes, the broker pops it
+# from the snapshot and its ``realized_pnl`` field disappears — so
+# summing ``p.realized_pnl`` over open positions silently shows ₹0
+# even on a day with multiple closed trades, which contradicts both
+# the sidebar (also journal-based) and reality. The journal's
+# ``net_pnl`` is the canonical day-realized number; the same value
+# the bot's risk math and EOD report use.
+realized = float(_summary.get("net_pnl", 0.0) or 0.0)
 
 # Out-of-market staleness note — explicitly tells the operator the figures
 # below come from the bot's last-persisted snapshot, not live ticks. The
@@ -1354,11 +1363,52 @@ if _hb and not is_market_open() and _hb_age is not None and _hb_age > 180:
         f"{int(_hb_age // 60)} min ago). They are not live."
     )
 
+# ── Hero P&L coherence check ─────────────────────────────────────────────────
+# The hero used to use the snapshot's ``daily_pnl_pct`` directly, which
+# the bot computes as ``(equity − _starting_equity) / _starting_equity``.
+# That's what drives the kill-switch and the profit-lock — so it's the
+# bot's BELIEF about today's P&L, but it can desync from the journal-
+# derived truth (realized + unrealized) in two ways:
+#   1. Cash leak from a pre-fix bug — the bot's equity reflects cash
+#      that may have been silently leaked, while the journal records
+#      the round-trip net correctly.
+#   2. ``_starting_equity`` captured at a moment when ``_equity()`` was
+#      transiently abnormal — every later P&L pct is then off by the
+#      same constant (this is the 2026-05-06 F&O "+100%" symptom).
+#
+# We now display the journal-derived P&L as the headline and surface a
+# warning banner when the bot's belief and the journal disagree by more
+# than ₹100 OR 0.5% of capital. The progress bar and lockin banner
+# inside the hero still use the bot's belief (``_today_pnl_pct``)
+# because those reflect the SIDE the bot is actually acting on.
+_today_pnl_inr_truth = realized + unrealized
+_today_pnl_pct_truth = (_today_pnl_inr_truth / max(seg_capital.total, 1.0)) * 100
+_today_pnl_inr_belief = seg_capital.total * _today_pnl_pct / 100.0
+_pnl_divergence = abs(_today_pnl_inr_truth - _today_pnl_inr_belief)
+if _pnl_divergence > 100 or abs(_today_pnl_pct_truth - _today_pnl_pct) > 0.5:
+    st.warning(
+        f"⚠️ [{seg.label}] **P&L disagreement**: bot believes "
+        f"₹{_today_pnl_inr_belief:+,.2f} ({_today_pnl_pct:+.2f}%) but the "
+        f"journal + open-position MTM totals ₹{_today_pnl_inr_truth:+,.2f} "
+        f"({_today_pnl_pct_truth:+.2f}%). The bot's belief drives the "
+        f"kill-switch and the profit-lock — if it's wrong, the bot may "
+        f"have already locked in or halted on a phantom number. Inspect:"
+        f"\n\n```\n"
+        f"redis-cli GET risk:starting_equity:{seg.value}\n"
+        f"redis-cli GET profit_lockin:{seg.value}\n"
+        f"redis-cli GET paper:state:{seg.value}\n"
+        f"```\n\n"
+        f"To recover today (clears the wrong baseline + lockin, then "
+        f"restart the bot):\n\n"
+        f"```\nredis-cli DEL risk:starting_equity:{seg.value} "
+        f"profit_lockin:{seg.value}\n```"
+    )
+
 # ─────────────────────────── Hero KPI strip ──────────────────────────────────
 render_hero_kpis(
     cash=cash, realized=realized, unrealized=unrealized,
     n_open=len(positions),
-    today_pnl_pct=_today_pnl_pct,
+    today_pnl_pct=_today_pnl_pct_truth,
     target_pct=seg_risk.daily_profit_target_pct,
     loss_cutoff_pct=seg_risk.max_daily_loss_pct,
     capital_total=seg_capital.total,

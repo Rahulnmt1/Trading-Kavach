@@ -57,10 +57,24 @@ class RiskManager:
         # against the 2% kill switch.
         self._starting_equity: Optional[float] = self._load_starting_equity()
         if self._starting_equity is not None:
-            logger.info(
-                "[risk:{}] restored starting_equity=₹{:,.2f} for {}",
-                segment.value, self._starting_equity, self._day,
-            )
+            configured = float(self._capital_cfg.total)
+            divergence_pct = (abs(self._starting_equity - configured)
+                              / max(configured, 1.0) * 100)
+            if divergence_pct > 5.0:
+                logger.warning(
+                    "[risk:{}] RESTORED suspicious starting_equity=₹{:,.2f} "
+                    "for {} (configured capital ₹{:,.2f}, divergence {:.1f}%). "
+                    "If this is wrong, the kill-switch + profit-lock will be "
+                    "off all day. To force a fresh capture: "
+                    "`redis-cli DEL {}` and restart the bot.",
+                    segment.value, self._starting_equity, self._day,
+                    configured, divergence_pct, self._equity_key,
+                )
+            else:
+                logger.info(
+                    "[risk:{}] restored starting_equity=₹{:,.2f} for {}",
+                    segment.value, self._starting_equity, self._day,
+                )
 
     def _load_starting_equity(self) -> Optional[float]:
         snap = self._cache.get_json(self._equity_key)
@@ -89,6 +103,98 @@ class RiskManager:
             # ``_daily_pnl_pct()`` call writes a fresh baseline.
             self._cache.delete(self._equity_key)
             logger.info("[risk:{}] new day {}, counters reset", self.segment.value, today)
+
+    def _equity_breakdown(self) -> dict:
+        """Return ``_equity()`` decomposed into named components.
+
+        Used by the diagnostic logger that fires every time
+        ``_starting_equity`` is captured — without the breakdown we can't
+        reconstruct *why* a wrong baseline got persisted (the 2026-05-06
+        F&O "+100%" symptom: ``_starting_equity`` was set to ~₹50K when
+        configured F&O capital is ₹100K, and the persisted Redis key
+        cemented the bad value for the rest of the day). Logging cash,
+        long-cost-basis, unrealized, margin-offset, and the per-position
+        contributions lets us see at a glance which term was abnormal at
+        capture time.
+        """
+        cash = self.broker.cash()
+        positions = self.broker.positions()
+        long_cost_basis = sum(p.avg_price * p.qty for p in positions if p.qty > 0)
+        unrealized = sum(p.unrealized_pnl for p in positions)
+        margin_offset = 0.0
+        per_position = []
+        for p in positions:
+            kind = getattr(p, "instrument_kind", InstrumentKind.EQUITY)
+            margin = float(getattr(p, "margin_blocked", 0.0) or 0.0)
+            contrib = 0.0
+            if kind == InstrumentKind.FUTURES:
+                contrib = margin
+                margin_offset += margin
+            elif kind in (InstrumentKind.SPREAD, InstrumentKind.IRON_CONDOR):
+                if p.qty < 0:
+                    credit_received = p.avg_price * abs(p.qty)
+                    contrib = margin - credit_received
+                    margin_offset += contrib
+            per_position.append({
+                "symbol": p.symbol, "qty": p.qty, "avg": round(p.avg_price, 2),
+                "kind": kind.value if hasattr(kind, "value") else str(kind),
+                "margin_blocked": round(margin, 2),
+                "unrealized_pnl": round(p.unrealized_pnl, 2),
+                "margin_offset_contrib": round(contrib, 2),
+            })
+        return {
+            "cash": round(cash, 2),
+            "long_cost_basis": round(long_cost_basis, 2),
+            "unrealized": round(unrealized, 2),
+            "margin_offset": round(margin_offset, 2),
+            "n_positions": len(positions),
+            "per_position": per_position,
+            "equity": round(cash + long_cost_basis + unrealized + margin_offset, 2),
+        }
+
+    def _capture_starting_equity(self, *, source: str) -> float:
+        """Snap ``_starting_equity`` and persist it, with diagnostic logging.
+
+        This is the single chokepoint for the "first read of the day"
+        capture. Every site that previously did
+        ``self._starting_equity = self._equity()`` now goes through
+        here so we always log the breakdown and the source path
+        ("first_pnl_call" / "record_trade" / "public_pnl_call").
+        """
+        breakdown = self._equity_breakdown()
+        self._starting_equity = breakdown["equity"]
+        self._persist_starting_equity()
+        configured = float(self._capital_cfg.total)
+        # Loud warning if the captured baseline diverges from configured
+        # capital by more than 5% — the F&O "+100%" symptom would have
+        # caught this (₹50K captured vs ₹100K configured = 50% divergence).
+        # 5% tolerance accommodates the legitimate margin-offset settling
+        # that happens when positions are already open at process start.
+        divergence_pct = abs(breakdown["equity"] - configured) / max(configured, 1.0) * 100
+        if divergence_pct > 5.0:
+            logger.warning(
+                "[risk:{}] BASELINE DIVERGENCE — captured _starting_equity="
+                "₹{:,.2f} differs from configured capital ₹{:,.2f} by {:.1f}%. "
+                "source={}  cash=₹{:,.2f}  long_cost_basis=₹{:,.2f}  "
+                "unrealized=₹{:,.2f}  margin_offset=₹{:,.2f}  n_positions={}. "
+                "Per-position: {}. This baseline drives the kill-switch + "
+                "profit-lock all day; if it's wrong, every later P&L pct is "
+                "off by the same constant.",
+                self.segment.value, breakdown["equity"], configured, divergence_pct,
+                source, breakdown["cash"], breakdown["long_cost_basis"],
+                breakdown["unrealized"], breakdown["margin_offset"],
+                breakdown["n_positions"], breakdown["per_position"],
+            )
+        else:
+            logger.info(
+                "[risk:{}] captured _starting_equity=₹{:,.2f} (source={}, "
+                "cash=₹{:,.2f}, unrealized=₹{:,.2f}, margin_offset=₹{:,.2f}, "
+                "n_positions={})",
+                self.segment.value, breakdown["equity"], source,
+                breakdown["cash"], breakdown["unrealized"],
+                breakdown["margin_offset"], breakdown["n_positions"],
+            )
+        return self._starting_equity
 
     def _equity(self) -> float:
         """Total account equity = cash + economic value of held positions.
@@ -147,8 +253,7 @@ class RiskManager:
 
     def _daily_pnl_pct(self) -> float:
         if self._starting_equity is None:
-            self._starting_equity = self._equity()
-            self._persist_starting_equity()
+            self._capture_starting_equity(source="first_pnl_call")
             return 0.0
         eq = self._equity()
         return (eq - self._starting_equity) / max(self._starting_equity, 1.0) * 100
@@ -407,8 +512,7 @@ class RiskManager:
     def record_trade(self) -> None:
         self._trades_today += 1
         if self._starting_equity is None:
-            self._starting_equity = self._equity()
-            self._persist_starting_equity()
+            self._capture_starting_equity(source="record_trade")
 
     def should_square_off(self, now_time) -> bool:
         return now_time >= self.cfg.session.t("square_off")
@@ -433,6 +537,5 @@ class RiskManager:
         """
         self._reset_if_new_day()
         if self._starting_equity is None:
-            self._starting_equity = self._equity()
-            self._persist_starting_equity()
+            self._capture_starting_equity(source="public_pnl_call")
         return self._daily_pnl_pct()
