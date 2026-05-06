@@ -1206,12 +1206,18 @@ render_header_pills(
 )
 
 # ─────────────────────────── Heartbeat-stale banner ──────────────────────────
-if _hb and is_market_open():
+# Compute heartbeat age unconditionally — used for the in-market alert AND
+# the out-of-market staleness note below the hero strip.
+_hb_age: float | None = None
+_hb_ts = None
+if _hb:
     try:
         _hb_ts = datetime.fromisoformat(_hb["ts"])
         _hb_age = (datetime.now(_hb_ts.tzinfo) - _hb_ts).total_seconds()
     except Exception:
         _hb_age = None
+
+if _hb and is_market_open():
     if _hb_age is not None and _hb_age > 180:
         mins = int(_hb_age // 60)
         st.error(
@@ -1229,9 +1235,21 @@ snap = cache.get_json(cache_key("portfolio", seg)) or {}
 positions = snap.get("positions", [])
 saved_capital = snap.get("starting_capital")
 if saved_capital is not None and abs(saved_capital - seg_capital.total) > 0.5:
-    # Capital changed in config — ignore the stale snapshot.
+    # Capital changed in config since the bot last persisted state. Show a
+    # warning so the operator notices, but DO NOT mutate Redis from the
+    # render path: the bot's ``_restore_state`` already discards a stale
+    # snapshot on next start (regression-pinned by FIX #2 in
+    # ``tests/test_fixes.py``). Deleting here from a Streamlit rerun
+    # would race the live bot — two browser tabs or a rerun mid-tick
+    # could wipe a freshly-written portfolio.
+    st.warning(
+        f"⚠️ [{seg.label}] Snapshot's starting_capital "
+        f"₹{saved_capital:,.0f} ≠ configured ₹{seg_capital.total:,.0f}. "
+        "The bot will reconcile on its next start (`_restore_state` "
+        "discards mismatched snapshots). Restart the bot OR run "
+        "`python -m cli reset --segment {seg}` to clear manually."
+    )
     snap, positions = {}, []
-    cache.delete(cache_key("portfolio", seg))
 cash       = snap.get("cash", seg_capital.total)
 realized   = sum(p.get("realized_pnl", 0)   for p in positions)
 unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
@@ -1239,6 +1257,22 @@ unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
 _summary       = daily_summary(segment=seg)
 _lockin        = cache.get_json(cache_key("profit_lockin", seg)) or {}
 _today_pnl_pct = float(snap.get("daily_pnl_pct", 0.0))
+
+# Out-of-market staleness note — explicitly tells the operator the figures
+# below come from the bot's last-persisted snapshot, not live ticks. The
+# in-market alert above is loud (red error / yellow warning); this one is
+# informational so post-session reviews don't mistake last-known state for
+# current state. Threshold matches the in-market alert (3 min).
+if _hb and not is_market_open() and _hb_age is not None and _hb_age > 180:
+    if _hb_ts is not None:
+        _stale_ts = _hb_ts.strftime("%Y-%m-%d %H:%M IST")
+    else:
+        _stale_ts = "unknown"
+    st.info(
+        f"ℹ️ [{seg.label}] Market closed — figures below are the bot's "
+        f"last persisted snapshot (heartbeat at {_stale_ts}, "
+        f"{int(_hb_age // 60)} min ago). They are not live."
+    )
 
 # ─────────────────────────── Hero KPI strip ──────────────────────────────────
 render_hero_kpis(
