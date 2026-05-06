@@ -1201,7 +1201,7 @@ seg_watchlist = cfg_watchlist_symbols(cfg, seg)
 # (from the live ``portfolio:{seg}`` snapshot) so the live picture
 # matches reality even before any close fires.
 with st.sidebar.container(border=True):
-    st.markdown("**Combined P&L (today)**")
+    st.markdown("**Today's P&L · both segments**")
     _eq_summary  = _cached_daily_summary(date.today(), Segment.EQUITY)
     _fno_summary = (_cached_daily_summary(date.today(), Segment.FNO)
                     if fno_enabled(cfg) else {"net_pnl": 0, "trades": 0})
@@ -1220,17 +1220,27 @@ with st.sidebar.container(border=True):
     fno_unreal, fno_n_open = (_seg_unreal_open(Segment.FNO)
                               if fno_enabled(cfg) else (0.0, 0))
 
-    st.metric("Equity (closed)", f"₹{eq_net:+,.2f}",
-              delta=f"{eq_n_closed} trades")
+    # Labels intentionally use "realized" / "open positions" rather than
+    # "closed" / "open" — "closed" was previously misread as "market
+    # closed" (it actually means closed = round-trip-completed trades).
+    st.metric("Equity — realized today", f"₹{eq_net:+,.2f}",
+              delta=f"{eq_n_closed} closed trades",
+              help="Net P&L from trades that completed a full round-trip "
+                   "(entry + exit) today. Source: trade journal.")
     if eq_n_open or eq_unreal:
-        st.caption(f"+ ₹{eq_unreal:+,.2f} unrealized · {eq_n_open} open")
+        st.caption(f"+ ₹{eq_unreal:+,.2f} unrealized · {eq_n_open} open positions")
     if fno_enabled(cfg):
-        st.metric("F&O (closed)", f"₹{fno_net:+,.2f}",
-                  delta=f"{fno_n_closed} trades")
+        st.metric("F&O — realized today", f"₹{fno_net:+,.2f}",
+                  delta=f"{fno_n_closed} closed trades",
+                  help="Net P&L from F&O trades that completed a full "
+                       "round-trip today. Source: trade journal.")
         if fno_n_open or fno_unreal:
-            st.caption(f"+ ₹{fno_unreal:+,.2f} unrealized · {fno_n_open} open")
+            st.caption(f"+ ₹{fno_unreal:+,.2f} unrealized · {fno_n_open} open positions")
         st.metric("Combined (realized + unrealized)",
-                  f"₹{eq_net + fno_net + eq_unreal + fno_unreal:+,.2f}")
+                  f"₹{eq_net + fno_net + eq_unreal + fno_unreal:+,.2f}",
+                  help="Realized (closed round-trips) + unrealized "
+                       "(mark-to-market on currently-open positions), "
+                       "across both segments.")
 
 # Risk envelope card — capital + caps for the SELECTED segment so the
 # operator can answer "what's my worst day look like?" without reading config.
