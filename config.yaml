@@ -71,14 +71,14 @@ watchlist:
     - HCLTECH
     - ADANIGREEN
     - HDFCBANK
-    - GAIL
     - ADANIPORTS
-    - NESTLEIND
     - ADANIENT
+    - NESTLEIND
     - IOC
     - INDUSINDBK
     - SBILIFE
-    - ONGC
+    - MARICO
+    - CHOLAFIN
 strategies:
   enabled:
     - orb

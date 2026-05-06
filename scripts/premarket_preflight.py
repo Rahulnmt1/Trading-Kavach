@@ -966,11 +966,28 @@ def run_preflight(args) -> int:
                 tee.print(f"    {_COLOR[Status.FAIL]}cleanup script crashed: {e}{_RESET}")
 
         # Optional: auto-clean stale Redis session keys on WARN.
-        if (result.status == Status.WARN
-                and result.name == "redis_session_freshness"
-                and args.clean_redis):
-            tee.print(f"    {_COLOR[Status.WARN]}--clean-redis specified — "
-                      f"invoking clean_redis_session.py{_RESET}")
+        # Fires for both:
+        #   * redis_session_freshness — stale intraday keys (signal:*,
+        #     trail:*, heartbeat:*, etc.)
+        #   * paper_state_clean with the ``may05_stale_portfolio``
+        #     signature — yesterday's portfolio:<seg> snapshot leaked
+        #     into today's dashboard. The WARN message itself points at
+        #     clean_redis_session.py, which already wipes
+        #     ``portfolio:<seg>`` via ``_exact_keys``. Without this
+        #     branch the user passes --clean-redis and nothing happens
+        #     because the script's gating only matched freshness.
+        clean_redis_warn = (
+            args.clean_redis
+            and result.status == Status.WARN
+            and (
+                result.name == "redis_session_freshness"
+                or (result.name == "paper_state_clean"
+                    and result.extras.get("signature") == "may05_stale_portfolio")
+            )
+        )
+        if clean_redis_warn:
+            tee.print(f"    {_COLOR[Status.WARN]}--clean-redis specified "
+                      f"({result.name}) — invoking clean_redis_session.py{_RESET}")
             try:
                 proc = subprocess.run(
                     [sys.executable,
@@ -1085,8 +1102,11 @@ def main() -> int:
     parser.add_argument(
         "--clean-redis", action="store_true",
         help="If the Redis session-freshness check finds stale intraday keys, "
-             "automatically run scripts/clean_redis_session.py to wipe them "
-             "and re-check. Off by default — review the WARN first."
+             "OR if paper_state_clean detects the 2026-05-05 stale-portfolio "
+             "signature (yesterday's portfolio:<seg> snapshot leaking into "
+             "today's dashboard), automatically run "
+             "scripts/clean_redis_session.py to wipe the stale keys and "
+             "re-check. Off by default — review the WARN first."
     )
     parser.add_argument(
         "--json", action="store_true",
