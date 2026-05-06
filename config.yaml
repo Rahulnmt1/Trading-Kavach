@@ -238,8 +238,16 @@ fno:
   risk:
     max_daily_loss_pct: 2.0
     max_loss_per_trade_pct: 5.0    # OPTIONS: full premium can be lost; widen
-    max_trades_per_day: 5
-    max_open_positions: 2
+    # 2026-05-06: bumped from 5 → 10 trades/day, 2 → 5 open positions to
+    # let the F&O bot actually utilise the ₹1L capital. With each
+    # credit-spread or iron-condor blocking only ~₹3-5K of margin (the
+    # max-loss × qty), 2 open positions = ~₹6-10K deployed = ~10% of
+    # capital. The previous caps were leaving ~80-90% of F&O capital
+    # idle. The hard daily-loss kill switch (-2%) and per-trade loss
+    # cap (5%) still bound the downside; this just lets the bot
+    # express its theta-edge across more concurrent positions.
+    max_trades_per_day: 10
+    max_open_positions: 5
     # For options: caps PREMIUM deployed at this % of capital. 50% means
     # one option position can use up to half the F&O budget.
     # For futures: caps margin deployed similarly.
@@ -261,19 +269,28 @@ fno:
       - NIFTY
       - BANKNIFTY
   strategies:
-    # Phase 4.5 default: credit_spread (directional, fires on EMA crosses
-    # — more frequent than iron_condor's EMA-convergence trigger). To
-    # trade something else:
-    #   - iron_condor             (Phase 4.5) — 4-leg neutral defined-risk
-    #                                           fires on EMA convergence
-    #                                           (range-bound regime)
-    #   - option_buy_directional  (Phase 3)   — long CE/PE
-    #   - futures_trend           (Phase 2)   — long/short index futures
-    #                                           (needs fno.capital.total ≥ ₹150K)
+    # 2026-05-06: enabled BOTH credit_spread and iron_condor. They
+    # operate in the same numeric space (net credit per share, ~₹40-80
+    # for NIFTY weeklies) AND have *mutually exclusive triggers* —
+    # credit_spread fires on a directional EMA cross, iron_condor fires
+    # on EMA convergence (range-bound regime). At any given moment the
+    # market is either trending or consolidating, so the two strategies
+    # cover complementary regimes without dissenting against each other.
+    # With ``min_agree: 1`` (below) either fires alone — exactly what we
+    # want for regime-aware stacking.
+    #
+    # The earlier comment block warned against multi-strategy F&O
+    # ensembles because mixing FUTURES (24400 spot) + OPTIONS (₹120
+    # premium) + SPREADS (₹70 net credit) puts SL/TP on incompatible
+    # numeric scales. credit_spread + iron_condor BOTH operate in the
+    # net-credit space, so the warning doesn't apply here. Adding
+    # futures_trend or option_buy_directional WOULD still need a
+    # separate F&O process per the original guidance.
     enabled:
       - credit_spread
+      - iron_condor
     ensemble:
-      min_agree: 1             # Single strategy — vote of one is consensus
+      min_agree: 1             # Either strategy fires alone (regime-aware)
     multitimeframe:
       enabled: false           # Phase 4.5: confirm via 15m EMA trend
     futures_trend:             # Used only when 'futures_trend' in `enabled`
