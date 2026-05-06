@@ -790,15 +790,51 @@ def render_performance_tab(*, segment: Segment, summary: dict) -> None:
         show_cols = [c for c in show_cols if c in trades_df.columns]
         st.dataframe(trades_df[show_cols], width="stretch", hide_index=True)
 
-        bs  = pd.DataFrame.from_dict(summary["by_strategy"], orient="index")
-        bsm = pd.DataFrame.from_dict(summary["by_symbol"],   orient="index")
-        cs1, cs2 = st.columns(2)
-        if not bs.empty:
-            cs1.markdown("**By strategy**")
-            cs1.dataframe(bs,  width="stretch")
+        # ── Per-strategy P&L breakdown ──────────────────────────────────
+        # The single most actionable analytic on this dashboard. If
+        # strategy A is consistently negative across many trades, the
+        # data is telling you to disable it. If strategy B is
+        # consistently positive, you've identified your real edge.
+        # Don't ignore a few-trades sample — but DO watch for trends
+        # over a full week+.
+        st.markdown("<div class='section-h'>🎯 By strategy — which one(s) are working?</div>",
+                    unsafe_allow_html=True)
+        bs_dict = summary.get("by_strategy", {})
+        if bs_dict:
+            with st.container(border=True):
+                strat_cols = st.columns(min(len(bs_dict), 4))
+                for i, (strat_name, stats) in enumerate(
+                        sorted(bs_dict.items(), key=lambda kv: -kv[1]["net_pnl"])):
+                    n = int(stats.get("trades", 0)) or 0
+                    w = int(stats.get("wins", 0)) or 0
+                    pnl = float(stats.get("net_pnl", 0.0)) or 0.0
+                    win_rate = (w / n * 100) if n else 0.0
+                    expectancy = (pnl / n) if n else 0.0
+                    delta_color = "normal" if pnl >= 0 else "inverse"
+                    col = strat_cols[i % len(strat_cols)]
+                    col.metric(
+                        f"{strat_name}",
+                        f"₹{pnl:+,.2f}",
+                        delta=f"{n} trades · {win_rate:.0f}% win",
+                        delta_color=delta_color,
+                    )
+                    col.caption(f"Expectancy: ₹{expectancy:+,.2f}/trade")
+                # Caveat row — calibrate the user's expectations.
+                total_n = sum(int(s.get("trades", 0)) for s in bs_dict.values())
+                if total_n < 30:
+                    st.caption(
+                        f"⚠ Only {total_n} trade(s) so far — too small a sample to "
+                        "conclude a strategy is broken or working. Aim for ≥30 "
+                        "trades per strategy before disabling."
+                    )
+        else:
+            st.info("No closed trades yet today.")
+
+        # By-symbol stays as a table; less important than strategy view.
+        bsm = pd.DataFrame.from_dict(summary["by_symbol"], orient="index")
         if not bsm.empty:
-            cs2.markdown("**By symbol**")
-            cs2.dataframe(bsm, width="stretch")
+            st.markdown("**By symbol**")
+            st.dataframe(bsm, width="stretch")
 
     today = date.today()
     with st.expander("🪵 Live trade log (raw events)"):
@@ -1434,6 +1470,29 @@ _tabs = st.tabs(_tab_labels)
 
 # Overview tab —— positions on the left, market schedule + picks + signals on the right.
 with _tabs[0]:
+    # Per-strategy preview at the top — most actionable diagnostic. Tells
+    # you at a glance which strategy(ies) are responsible for today's
+    # P&L. Full breakdown with per-trade expectancy lives in the
+    # Performance tab.
+    _bs_preview = _summary.get("by_strategy", {}) if _summary else {}
+    if _bs_preview:
+        with st.container(border=True):
+            st.markdown("<div class='section-h'>🎯 Per-strategy P&L (today)</div>",
+                        unsafe_allow_html=True)
+            _strat_cols = st.columns(min(len(_bs_preview), 4))
+            for _i, (_strat_name, _stats) in enumerate(
+                    sorted(_bs_preview.items(), key=lambda kv: -kv[1]["net_pnl"])):
+                _n = int(_stats.get("trades", 0)) or 0
+                _w = int(_stats.get("wins", 0)) or 0
+                _pnl = float(_stats.get("net_pnl", 0.0)) or 0.0
+                _wr = (_w / _n * 100) if _n else 0.0
+                _col = _strat_cols[_i % len(_strat_cols)]
+                _col.metric(
+                    _strat_name, f"₹{_pnl:+,.2f}",
+                    delta=f"{_n}T · {_wr:.0f}% win",
+                    delta_color="normal" if _pnl >= 0 else "inverse",
+                )
+
     left, right = st.columns([1.55, 1.0])
     with left:
         st.markdown("<div class='section-h'>💼 Open positions — net P&L after charges & taxes</div>",

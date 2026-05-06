@@ -21,15 +21,22 @@ risk:
   max_trades_per_day: 10
   max_open_positions: 3         # Cannot hold more than this many open positions
   max_position_pct: 25.0        # No single position larger than 25% of capital
-  reward_risk_ratio: 1.5        # Target gain = 1.5 * stop-loss distance
+  reward_risk_ratio: 2.0        # Target gain = 2.0 * stop-loss distance
   trailing_stop: true           # Once +1R is reached, trail SL with ATR
   # ATR-based stop-loss / take-profit (applies to ALL strategies uniformly).
   # SL distance = sl_atr_mult * ATR(14)  on the bar's timeframe (5m).
-  # TP distance = tp_atr_mult * ATR(14)  — i.e. reward = 1.5R by default.
-  # Tighter than the strategy-native SLs, so trades resolve intraday instead
-  # of being closed by the EOD square-off most of the time.
-  sl_atr_mult: 1.0
-  tp_atr_mult: 1.5
+  # TP distance = tp_atr_mult * ATR(14)  — i.e. reward = 2.0R by default.
+  #
+  # 2026-05-06: widened from 1.0 / 1.5 → 1.5 / 3.0 to give intraday
+  # trades enough room to overcome fee + slippage drag. With a ₹100K
+  # account and the watchlist's typical ATR (~0.5% of price), the
+  # previous 1.0×ATR stop produced per-trade gross R of only ₹80-150
+  # while round-trip fees + slippage cost ~₹50-100 per trade. That
+  # required a >60% win rate just to break even. At 1.5×ATR / 3.0×ATR,
+  # the same risk_per_trade budget produces a ~₹250 gross win vs ~₹125
+  # gross loss, lowering break-even win-rate from ~64% to ~45%.
+  sl_atr_mult: 1.5
+  tp_atr_mult: 3.0
   # ── Trailing stop tuning (only used if trailing_stop: true) ──
   # When unrealized profit reaches `trail_activation_r` × R, ratchet the
   # stop up so we can never lose more than (R − `trail_lock_r` × R) — i.e.
@@ -80,15 +87,23 @@ watchlist:
     - MARICO
     - CHOLAFIN
 strategies:
+  # 2026-05-06: dropped vwap_revert from the enabled list. It is a pure
+  # counter-trend strategy (fade rallies / catch falling knives) that on
+  # this watchlist mostly produced dissent against ORB / EMA-Supertrend
+  # trend signals. The Ensemble's "no dissent" voting rule then killed
+  # legitimate trend trades when VWAP-revert disagreed, leaving the bot
+  # to trade only at unusual regime moments — exactly the conditions
+  # where retail counter-trend setups have the weakest statistical edge.
+  # If you want to re-test it, add it back here AND raise ensemble
+  # min_agree to 2 with the 3-strategy lineup.
   enabled:
     - orb
-    - vwap_revert
     - ema_supertrend
   ensemble:
-    # Production / accuracy mode: only fire when at least 2 of the 3
-    # strategies agree on direction (and none disagrees). The 1-of-3
-    # paper-test mode that ran on 2026-04-28 has been reverted now that
-    # the order pipeline is verified end-to-end.
+    # With 2 trend-following strategies enabled, min_agree=2 means BOTH
+    # must agree (i.e. unanimous). This is intentionally conservative —
+    # quality over quantity. If you want more trade frequency at lower
+    # quality, drop to min_agree=1 (single-strategy entries fire).
     min_agree: 2
   multitimeframe:
     enabled: true               # Wrap each strategy in MTF confirmation
@@ -97,6 +112,10 @@ strategies:
   orb:
     range_minutes: 15           # Opening range = first 15 minutes
     breakout_buffer_pct: 0.05   # Require 0.05% break above/below range
+    # 2026-05-06: only fire ORB before this time (IST). Empirically,
+    # opening-range follow-through edge decays by mid-morning; later
+    # "breakouts" tend to mean-revert by EOD square-off.
+    entry_cutoff: "11:30"
   vwap_revert:
     deviation_pct: 0.6          # Enter when price >0.6% from VWAP
     rsi_overbought: 70
@@ -219,8 +238,16 @@ fno:
   risk:
     max_daily_loss_pct: 2.0
     max_loss_per_trade_pct: 5.0    # OPTIONS: full premium can be lost; widen
-    max_trades_per_day: 5
-    max_open_positions: 2
+    # 2026-05-06: bumped from 5 → 10 trades/day, 2 → 5 open positions to
+    # let the F&O bot actually utilise the ₹1L capital. With each
+    # credit-spread or iron-condor blocking only ~₹3-5K of margin (the
+    # max-loss × qty), 2 open positions = ~₹6-10K deployed = ~10% of
+    # capital. The previous caps were leaving ~80-90% of F&O capital
+    # idle. The hard daily-loss kill switch (-2%) and per-trade loss
+    # cap (5%) still bound the downside; this just lets the bot
+    # express its theta-edge across more concurrent positions.
+    max_trades_per_day: 10
+    max_open_positions: 5
     # For options: caps PREMIUM deployed at this % of capital. 50% means
     # one option position can use up to half the F&O budget.
     # For futures: caps margin deployed similarly.
@@ -242,19 +269,28 @@ fno:
       - NIFTY
       - BANKNIFTY
   strategies:
-    # Phase 4.5 default: credit_spread (directional, fires on EMA crosses
-    # — more frequent than iron_condor's EMA-convergence trigger). To
-    # trade something else:
-    #   - iron_condor             (Phase 4.5) — 4-leg neutral defined-risk
-    #                                           fires on EMA convergence
-    #                                           (range-bound regime)
-    #   - option_buy_directional  (Phase 3)   — long CE/PE
-    #   - futures_trend           (Phase 2)   — long/short index futures
-    #                                           (needs fno.capital.total ≥ ₹150K)
+    # 2026-05-06: enabled BOTH credit_spread and iron_condor. They
+    # operate in the same numeric space (net credit per share, ~₹40-80
+    # for NIFTY weeklies) AND have *mutually exclusive triggers* —
+    # credit_spread fires on a directional EMA cross, iron_condor fires
+    # on EMA convergence (range-bound regime). At any given moment the
+    # market is either trending or consolidating, so the two strategies
+    # cover complementary regimes without dissenting against each other.
+    # With ``min_agree: 1`` (below) either fires alone — exactly what we
+    # want for regime-aware stacking.
+    #
+    # The earlier comment block warned against multi-strategy F&O
+    # ensembles because mixing FUTURES (24400 spot) + OPTIONS (₹120
+    # premium) + SPREADS (₹70 net credit) puts SL/TP on incompatible
+    # numeric scales. credit_spread + iron_condor BOTH operate in the
+    # net-credit space, so the warning doesn't apply here. Adding
+    # futures_trend or option_buy_directional WOULD still need a
+    # separate F&O process per the original guidance.
     enabled:
       - credit_spread
+      - iron_condor
     ensemble:
-      min_agree: 1             # Single strategy — vote of one is consensus
+      min_agree: 1             # Either strategy fires alone (regime-aware)
     multitimeframe:
       enabled: false           # Phase 4.5: confirm via 15m EMA trend
     futures_trend:             # Used only when 'futures_trend' in `enabled`
