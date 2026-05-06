@@ -34,6 +34,22 @@ class ORBStrategy(Strategy):
         if opening_range.empty:
             return self.hold(symbol, float(df["close"].iloc[-1]), "no opening range yet", self.name)
 
+        # Entry-cutoff gate: ORB has follow-through edge mainly in the
+        # first ~2 hours of the session. After ``entry_cutoff`` the
+        # morning range has been bounded for so long that "breakouts"
+        # of it are typically late moves that mean-revert by EOD. A bar
+        # at or after the cutoff returns HOLD even if price is breaking
+        # out — let other strategies (e.g. EMA-Supertrend) take that
+        # later trade if they have edge there.
+        h, m = self.cfg.entry_cutoff.split(":")
+        entry_cutoff_t = time(int(h), int(m))
+        last_bar_time = df.index[-1].time()
+        if last_bar_time >= entry_cutoff_t:
+            return self.hold(
+                symbol, float(df["close"].iloc[-1]),
+                f"past entry cutoff {self.cfg.entry_cutoff}", self.name,
+            )
+
         rng_high = float(opening_range["high"].max())
         rng_low = float(opening_range["low"].min())
         ltp = float(df["close"].iloc[-1])

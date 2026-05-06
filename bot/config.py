@@ -103,6 +103,14 @@ class SessionCfg(BaseModel):
 class ORBCfg(BaseModel):
     range_minutes: int = 15
     breakout_buffer_pct: float = 0.05
+    # ``HH:MM`` IST. ORB will return HOLD for any bar whose timestamp
+    # is at or after this time. Default 11:30 reflects the empirical
+    # observation that opening-range breakouts have follow-through edge
+    # mostly in the first ~2 hours of the session; later "breakouts" of
+    # the morning range are typically late moves that mean-revert by
+    # square-off. Set to "13:30" (= ``session.trade_cutoff``) to disable
+    # this gate and let ORB fire any time during the trading window.
+    entry_cutoff: str = "11:30"
 
 
 class VWAPRevertCfg(BaseModel):

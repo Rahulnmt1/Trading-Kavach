@@ -21,15 +21,22 @@ risk:
   max_trades_per_day: 10
   max_open_positions: 3         # Cannot hold more than this many open positions
   max_position_pct: 25.0        # No single position larger than 25% of capital
-  reward_risk_ratio: 1.5        # Target gain = 1.5 * stop-loss distance
+  reward_risk_ratio: 2.0        # Target gain = 2.0 * stop-loss distance
   trailing_stop: true           # Once +1R is reached, trail SL with ATR
   # ATR-based stop-loss / take-profit (applies to ALL strategies uniformly).
   # SL distance = sl_atr_mult * ATR(14)  on the bar's timeframe (5m).
-  # TP distance = tp_atr_mult * ATR(14)  — i.e. reward = 1.5R by default.
-  # Tighter than the strategy-native SLs, so trades resolve intraday instead
-  # of being closed by the EOD square-off most of the time.
-  sl_atr_mult: 1.0
-  tp_atr_mult: 1.5
+  # TP distance = tp_atr_mult * ATR(14)  — i.e. reward = 2.0R by default.
+  #
+  # 2026-05-06: widened from 1.0 / 1.5 → 1.5 / 3.0 to give intraday
+  # trades enough room to overcome fee + slippage drag. With a ₹100K
+  # account and the watchlist's typical ATR (~0.5% of price), the
+  # previous 1.0×ATR stop produced per-trade gross R of only ₹80-150
+  # while round-trip fees + slippage cost ~₹50-100 per trade. That
+  # required a >60% win rate just to break even. At 1.5×ATR / 3.0×ATR,
+  # the same risk_per_trade budget produces a ~₹250 gross win vs ~₹125
+  # gross loss, lowering break-even win-rate from ~64% to ~45%.
+  sl_atr_mult: 1.5
+  tp_atr_mult: 3.0
   # ── Trailing stop tuning (only used if trailing_stop: true) ──
   # When unrealized profit reaches `trail_activation_r` × R, ratchet the
   # stop up so we can never lose more than (R − `trail_lock_r` × R) — i.e.
@@ -80,15 +87,23 @@ watchlist:
     - SBILIFE
     - ONGC
 strategies:
+  # 2026-05-06: dropped vwap_revert from the enabled list. It is a pure
+  # counter-trend strategy (fade rallies / catch falling knives) that on
+  # this watchlist mostly produced dissent against ORB / EMA-Supertrend
+  # trend signals. The Ensemble's "no dissent" voting rule then killed
+  # legitimate trend trades when VWAP-revert disagreed, leaving the bot
+  # to trade only at unusual regime moments — exactly the conditions
+  # where retail counter-trend setups have the weakest statistical edge.
+  # If you want to re-test it, add it back here AND raise ensemble
+  # min_agree to 2 with the 3-strategy lineup.
   enabled:
     - orb
-    - vwap_revert
     - ema_supertrend
   ensemble:
-    # Production / accuracy mode: only fire when at least 2 of the 3
-    # strategies agree on direction (and none disagrees). The 1-of-3
-    # paper-test mode that ran on 2026-04-28 has been reverted now that
-    # the order pipeline is verified end-to-end.
+    # With 2 trend-following strategies enabled, min_agree=2 means BOTH
+    # must agree (i.e. unanimous). This is intentionally conservative —
+    # quality over quantity. If you want more trade frequency at lower
+    # quality, drop to min_agree=1 (single-strategy entries fire).
     min_agree: 2
   multitimeframe:
     enabled: true               # Wrap each strategy in MTF confirmation
@@ -97,6 +112,10 @@ strategies:
   orb:
     range_minutes: 15           # Opening range = first 15 minutes
     breakout_buffer_pct: 0.05   # Require 0.05% break above/below range
+    # 2026-05-06: only fire ORB before this time (IST). Empirically,
+    # opening-range follow-through edge decays by mid-morning; later
+    # "breakouts" tend to mean-revert by EOD square-off.
+    entry_cutoff: "11:30"
   vwap_revert:
     deviation_pct: 0.6          # Enter when price >0.6% from VWAP
     rsi_overbought: 70
