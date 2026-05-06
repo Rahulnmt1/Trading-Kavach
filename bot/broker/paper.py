@@ -573,10 +573,22 @@ class PaperBroker(Broker):
                     # is always BUY here.
                     self._cash += existing.avg_price * close_qty + pnl
                 else:
-                    # Equity legacy branch — preserved verbatim from the
-                    # pre-Phase-2 code so behaviour is unchanged.
-                    self._cash += existing.avg_price * close_qty + pnl if existing.side == OrderSide.BUY else \
-                                  -existing.avg_price * close_qty + close_qty * (existing.avg_price - fill) - fees
+                    # Equity legacy branch.
+                    if existing.side == OrderSide.BUY:
+                        # Long close: recover cost basis (debited at open) +
+                        # realized P&L (already net of close fees).
+                        self._cash += existing.avg_price * close_qty + pnl
+                    else:
+                        # Short close: paper broker does NOT credit short
+                        # proceeds at open (see RiskManager._equity docstring),
+                        # so on close we add only the realized P&L. The
+                        # ``avg_price * close_qty`` term in the BUY branch
+                        # represents recovered long cost basis — there is
+                        # no cost basis to recover on a short. The pre-fix
+                        # formula was off by exactly ``avg_price * close_qty``,
+                        # silently leaking that amount of cash on every
+                        # equity short close.
+                        self._cash += pnl
 
                 if new_qty == 0:
                     self._positions.pop(order.symbol)

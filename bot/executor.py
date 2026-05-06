@@ -93,7 +93,35 @@ class Executor:
         # every tick (entries added, vanished symbols dropped).
         self._trails: Dict[str, _TrailState] = {}
         # Once profit lock-in fires we set this and stay locked for the day.
-        self._profit_locked: bool = False
+        # Restore the flag if a previous process today already hit the
+        # profit target — without this, a mid-session restart would clear
+        # the in-memory flag and the bot would resume opening trades,
+        # potentially reversing the locked-in P&L. The Redis snapshot is
+        # written by ``_lock_in_for_day`` and stamped with the wall-clock
+        # date; we honour it only if it was created today (IST).
+        self._profit_locked: bool = self._restore_profit_lock()
+
+    def _restore_profit_lock(self) -> bool:
+        snap = self.cache.get_json(self._profit_lock_key)
+        if not isinstance(snap, dict):
+            return False
+        ts = snap.get("ts", "")
+        # ``ts`` was written via ``datetime.now(IST).isoformat()``; the
+        # leading ``YYYY-MM-DD`` slice is the IST trading date.
+        today_iso = datetime.now(IST).date().isoformat()
+        if isinstance(ts, str) and ts.startswith(today_iso):
+            logger.warning(
+                "[profit-lock:{}] restored from earlier today: pnl_pct={}%, "
+                "target_pct={}% — bot will not open new entries until the "
+                "next trading day rollover.",
+                self.segment.value,
+                snap.get("pnl_pct"), snap.get("target_pct"),
+            )
+            return True
+        # Stale snapshot from a previous day — purge it so the new day
+        # starts clean.
+        self.cache.delete(self._profit_lock_key)
+        return False
         # F&O Phase 1 has no strategies registered yet; we log a clear
         # idle marker on the FIRST tick so the operator sees it but
         # don't spam the log every minute thereafter.
@@ -257,8 +285,13 @@ class Executor:
             if not decision.allow:
                 self.notifier.rejection(sig, decision.reason)
                 continue
-            self._place(sig, decision.qty)
-            self.risk.record_trade()
+            # Only count the trade against ``max_trades_per_day`` when the
+            # broker actually fills it. Pre-fix: rejections (insufficient
+            # cash, parse failures, over-sell guard) silently consumed the
+            # daily quota and could throttle the bot below the configured
+            # cap before the profit target was reachable.
+            if self._place(sig, decision.qty):
+                self.risk.record_trade()
 
         self._publish_state()
 
@@ -522,7 +555,15 @@ class Executor:
             "target_pct": self.cfg.risk.daily_profit_target_pct,
         }, ttl=86400)
 
-    def _place(self, sig: Signal, qty: int) -> None:
+    def _place(self, sig: Signal, qty: int) -> bool:
+        """Place an entry order. Returns True iff the broker filled it.
+
+        The caller uses the return value to gate ``risk.record_trade()`` —
+        without this, every rejected order (insufficient cash, F&O parse
+        failure, paper broker over-sell guard, ...) would still increment
+        the daily-trade counter and silently throttle the bot below the
+        configured ``max_trades_per_day``.
+        """
         side = OrderSide.BUY if sig.type == SignalType.BUY else OrderSide.SELL
         order_kwargs = dict(
             id=str(uuid.uuid4()), symbol=sig.symbol, side=side, qty=qty,
@@ -547,7 +588,7 @@ class Executor:
                 order_kwargs["lot_size"] = _lot_size(sig.symbol)
             except KeyError as e:
                 logger.error("[fno] cannot place order for {}: {}", sig.symbol, e)
-                return
+                return False
             if parse_iron_condor_tradingsymbol(sig.symbol) is not None:
                 order_kwargs["instrument_kind"] = InstrumentKind.IRON_CONDOR
             elif parse_spread_tradingsymbol(sig.symbol) is not None:
@@ -570,6 +611,8 @@ class Executor:
             self.journal.record_fill(result, before, after, {
                 "strategy": sig.strategy, "reason": sig.reason,
             })
+            return True
+        return False
 
     def _end_of_day(self, *, mark_done: bool = True) -> None:
         # ── Idempotency guard (FIX #13a, refined 2026-05-05 PM) ──────────

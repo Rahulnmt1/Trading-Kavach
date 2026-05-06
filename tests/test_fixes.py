@@ -952,6 +952,13 @@ def main() -> int:
         reason="(test) high-credit ATM bull-put",
     )
     risk_mgr = RiskManager(rsk_broker, segment=Segment.FNO)
+    # Monkey-patch the loaded F&O capital to ₹50K so the sizing math
+    # matches the test's stated intent ("1-lot spread on ₹50K capital").
+    # Without this, the RiskManager reads ``fno.capital.total`` from
+    # config.yaml (₹1,00,000) — making max_loss_budget=₹5,000 and
+    # approving 3 lots given the 21/share stop, which is the correct
+    # behaviour for a 100K account but not what this test wants to verify.
+    risk_mgr._capital_cfg.total = 50_000.0
     decision = risk_mgr.evaluate(favourable_sig)
     if not decision.allow or decision.qty != 75:
         print(f"  ✗ FAILED — risk manager rejected 1-lot spread on ₹50K: allow={decision.allow}, "
@@ -1293,7 +1300,7 @@ def main() -> int:
     # still blocking the exact 2026-05-04 phantom-short path: a
     # ``square_off_all``-originated SELL that arrives after another
     # square-off has already cleared the position.
-    eq_broker = PaperBroker(segment=Segment.EQUITY, capital=100_000.0)
+    eq_broker = PaperBroker(segment=Segment.EQUITY)
     eq_broker.update_marks({"TESTSYM": 1000.0})
 
     # (b.1) Fresh strategy-driven SELL on a flat book MUST fill (this is
@@ -1318,7 +1325,7 @@ def main() -> int:
     # exactly the way ``square_off_all`` does — with ``is_squareoff=True``
     # — but on a symbol that the broker no longer holds (the second
     # concurrent square-off looking at a stale snapshot).
-    eq_broker_b2 = PaperBroker(segment=Segment.EQUITY, capital=100_000.0)
+    eq_broker_b2 = PaperBroker(segment=Segment.EQUITY)
     eq_broker_b2.update_marks({"GHOSTSYM": 1000.0})
     orphan_squareoff = Order(
         id="t-oversell-orphan", symbol="GHOSTSYM", side=OrderSide.SELL, qty=10,
@@ -1335,8 +1342,14 @@ def main() -> int:
 
     # (b.3) Over-sell beyond held qty MUST reject (closing more than we
     # hold would leak cash via a residual phantom short).
+    # Clear persisted state so b3's broker starts on a clean book — without
+    # this, b1's persisted SHORT TESTSYM would be restored, b3's BUY 10
+    # would silently close it (rather than open a new long), and the
+    # subsequent SELL 20 would land on a flat book and be accepted as a
+    # legitimate strategy-driven short entry per FIX #13b refinement.
+    cache.delete("paper:state:equity")
     eq_broker.update_marks({"TESTSYM": 1000.0})
-    eq_broker_b3 = PaperBroker(segment=Segment.EQUITY, capital=100_000.0)
+    eq_broker_b3 = PaperBroker(segment=Segment.EQUITY)
     eq_broker_b3.update_marks({"TESTSYM": 1000.0})
     buy_order = Order(
         id="t-oversell-2-buy", symbol="TESTSYM", side=OrderSide.BUY, qty=10,
@@ -1367,7 +1380,7 @@ def main() -> int:
     # (a) `_end_of_day` idempotency — second concurrent call is a no-op.
     cache.delete("eod_done:equity")
     cache.delete("paper:state:equity")
-    eq_broker2 = PaperBroker(segment=Segment.EQUITY, capital=100_000.0)
+    eq_broker2 = PaperBroker(segment=Segment.EQUITY)
     eq_broker2.update_marks({"FOO": 100.0})
     eq_broker2.place_order(Order(
         id="t-eod-buy", symbol="FOO", side=OrderSide.BUY, qty=50,
@@ -1383,9 +1396,13 @@ def main() -> int:
             self.cache = cache
             self.segment = Segment.EQUITY
             self.cfg = cfg
-            from bot.notifier import NullNotifier
+            # The repo has no separate ``NullNotifier`` class — the regular
+            # ``Notifier`` short-circuits to a no-op when SMTP env vars
+            # are unset (``self.enabled == False``), which is exactly what
+            # we want under test.
+            from bot.notify import Notifier
             from bot.journal import TradeJournal
-            self.notifier = NullNotifier()
+            self.notifier = Notifier()
             self.journal = TradeJournal(segment=Segment.EQUITY)
 
         def _publish_state(self): pass

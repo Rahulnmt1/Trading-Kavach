@@ -54,6 +54,28 @@ def to_yf(symbol: str) -> str:
     return f"{symbol}.NS"
 
 
+def _interval_to_timedelta(interval: str) -> Optional[timedelta]:
+    """Parse a yfinance interval string into a ``timedelta``.
+
+    Supports the intraday forms we actually use (``"1m"``, ``"5m"``,
+    ``"15m"``, ``"30m"``, ``"60m"``, ``"1h"``). Daily / weekly / unknown
+    intervals return ``None`` — the caller skips the partial-bar trim
+    for those (backtests work off fully-closed daily bars).
+    """
+    if not interval:
+        return None
+    unit = interval[-1].lower()
+    try:
+        n = int(interval[:-1])
+    except ValueError:
+        return None
+    if unit == "m":
+        return timedelta(minutes=n)
+    if unit == "h":
+        return timedelta(hours=n)
+    return None
+
+
 def history(symbol: str, days: int = 5, interval: str = "1m") -> pd.DataFrame:
     """Fetch OHLCV. yfinance limits intraday lookback (~7 days for 1m)."""
     ticker = yf.Ticker(to_yf(symbol))
@@ -65,6 +87,18 @@ def history(symbol: str, days: int = 5, interval: str = "1m") -> pd.DataFrame:
     df = df.rename(columns=str.lower)
     df.index = df.index.tz_convert(IST) if df.index.tz else df.index.tz_localize("UTC").tz_convert(IST)
     df = df[["open", "high", "low", "close", "volume"]].dropna()
+    # Drop the still-forming last bar. yfinance returns the in-progress
+    # candle (timestamp = bar START), so at e.g. 10:14:30 IST the 5m frame
+    # ends with the half-formed 10:10–10:15 bar. Strategies reading
+    # ``df.iloc[-1]`` would see flickering OHLC inside a 5-min window
+    # and could whipsaw between BUY/HOLD multiple times within the same
+    # bar; the backtester sees the closed bar and over-reports edge.
+    # Trimming here aligns live with backtest and removes the lookahead.
+    delta = _interval_to_timedelta(interval)
+    if delta is not None and len(df) > 0:
+        last_bar_end = df.index[-1] + delta
+        if last_bar_end > datetime.now(IST):
+            df = df.iloc[:-1]
     return df
 
 

@@ -74,7 +74,7 @@ _RATES: Dict[str, float] = {
 # the impact on a per-trade basis is sub-rupee.
 _FUTURES_RATES: Dict[str, float] = {
     "brokerage_flat":        20.0,        # ₹20 flat per order — NO percentage cap
-    "stt_sell_pct":          0.0005,    # 0.05% on sell-side contract value
+    "stt_sell_pct":          0.000125,    # 0.0125% on sell-side contract value
     "exchange_pct":          0.0000183,   # NSE F&O: 0.00183% per leg
     "sebi_per_crore":        10.0,        # Same as equity
     "stamp_buy_pct":         0.00002,     # 0.002% on buy-side contract value
@@ -97,7 +97,7 @@ _FUTURES_RATES: Dict[str, float] = {
 # Buyers pay zero STT (it's reflected in the rate being sell-only).
 _OPTIONS_RATES: Dict[str, float] = {
     "brokerage_flat":        20.0,        # ₹20 flat per order — NO percentage cap
-    "stt_sell_pct":          0.0015,    # 0.15% on PREMIUM-sell side ONLY
+    "stt_sell_pct":          0.000625,    # 0.0625% on PREMIUM-sell side ONLY
     "exchange_pct":          0.0003553,    # NSE options: 0.03553% on premium per leg
     "sebi_per_crore":        10.0,        # ₹10 per crore of premium turnover
     "stamp_buy_pct":         0.00003,     # 0.003% on premium-buy side ONLY

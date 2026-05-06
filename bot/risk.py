@@ -15,12 +15,19 @@ from pathlib import Path
 from typing import Optional
 
 from .broker.base import Broker, InstrumentKind
+from .cache import get_cache
 from .config import PROJECT_ROOT, load_config
 from .logger import logger
-from .segment import Segment, cfg_capital, cfg_risk
+from .segment import Segment, cache_key, cfg_capital, cfg_risk
 from .strategies.base import Signal, SignalType
 
 KILL_SWITCH = PROJECT_ROOT / "KILL_SWITCH"
+
+# TTL for the persisted starting-equity snapshot. 36 hours covers an
+# overnight restart on a normal weekday and a Friday-evening → Monday-
+# morning gap (the snapshot's stored date prevents stale data from
+# leaking into a new trading day even if Redis somehow keeps the key).
+_STARTING_EQUITY_TTL_S = 36 * 3600
 
 
 @dataclass
@@ -39,9 +46,38 @@ class RiskManager:
         # ``capital`` / ``risk``; F&O reads ``fno.capital`` / ``fno.risk``.
         self._capital_cfg = cfg_capital(self.cfg, segment)
         self._risk_cfg = cfg_risk(self.cfg, segment)
+        self._cache = get_cache()
+        self._equity_key = cache_key("risk:starting_equity", segment)
         self._trades_today = 0
         self._day = date.today()
-        self._starting_equity: Optional[float] = None
+        # Restore the kill-switch baseline persisted by an earlier process
+        # today (if any). Without this, a mid-session restart would resnap
+        # ``_starting_equity`` from current equity — silently zeroing the
+        # daily-loss meter so a -1.5% drawdown would no longer count
+        # against the 2% kill switch.
+        self._starting_equity: Optional[float] = self._load_starting_equity()
+        if self._starting_equity is not None:
+            logger.info(
+                "[risk:{}] restored starting_equity=₹{:,.2f} for {}",
+                segment.value, self._starting_equity, self._day,
+            )
+
+    def _load_starting_equity(self) -> Optional[float]:
+        snap = self._cache.get_json(self._equity_key)
+        if isinstance(snap, dict) and snap.get("date") == self._day.isoformat():
+            try:
+                return float(snap["value"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
+
+    def _persist_starting_equity(self) -> None:
+        if self._starting_equity is None:
+            return
+        self._cache.set_json(self._equity_key, {
+            "date": self._day.isoformat(),
+            "value": self._starting_equity,
+        }, ttl=_STARTING_EQUITY_TTL_S)
 
     def _reset_if_new_day(self) -> None:
         today = date.today()
@@ -49,6 +85,9 @@ class RiskManager:
             self._day = today
             self._trades_today = 0
             self._starting_equity = None
+            # Drop yesterday's persisted snapshot so the new day's first
+            # ``_daily_pnl_pct()`` call writes a fresh baseline.
+            self._cache.delete(self._equity_key)
             logger.info("[risk:{}] new day {}, counters reset", self.segment.value, today)
 
     def _equity(self) -> float:
@@ -109,6 +148,7 @@ class RiskManager:
     def _daily_pnl_pct(self) -> float:
         if self._starting_equity is None:
             self._starting_equity = self._equity()
+            self._persist_starting_equity()
             return 0.0
         eq = self._equity()
         return (eq - self._starting_equity) / max(self._starting_equity, 1.0) * 100
@@ -368,6 +408,7 @@ class RiskManager:
         self._trades_today += 1
         if self._starting_equity is None:
             self._starting_equity = self._equity()
+            self._persist_starting_equity()
 
     def should_square_off(self, now_time) -> bool:
         return now_time >= self.cfg.session.t("square_off")
@@ -393,4 +434,5 @@ class RiskManager:
         self._reset_if_new_day()
         if self._starting_equity is None:
             self._starting_equity = self._equity()
+            self._persist_starting_equity()
         return self._daily_pnl_pct()
