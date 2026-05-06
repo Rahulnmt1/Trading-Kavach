@@ -935,6 +935,12 @@ def main() -> int:
     # the strategy will surface live; we test the favorable case here to
     # confirm the FNO branch's spread sizing path itself works end-to-end.)
     cache.delete(cache_key("paper:state", Segment.FNO))
+    # FIX #18 (durable kill-switch baseline) caches _starting_equity to
+    # Redis on first evaluate(). The test broker below is set to ₹50K,
+    # so that capture would persist a wrong baseline that contaminates
+    # tomorrow's live F&O bot start. Clear before AND after.
+    cache.delete("risk:starting_equity:fno")
+    cache.delete("profit_lockin:fno")
     rsk_broker = PaperBroker(segment=Segment.FNO)
     rsk_broker._starting_cash = 50_000.0
     rsk_broker._cash = 50_000.0
@@ -968,6 +974,10 @@ def main() -> int:
           f"({decision.reason})")
 
     cache.delete(cache_key("paper:state", Segment.FNO))
+    # Cleanup baseline + lockin so this test doesn't contaminate the
+    # next F&O bot start with a stale ₹50K _starting_equity.
+    cache.delete("risk:starting_equity:fno")
+    cache.delete("profit_lockin:fno")
 
     banner("FIX #10 — F&O IRON CONDOR round-trip + delta-neutral Greeks (Phase 4.5)")
 
@@ -1102,6 +1112,10 @@ def main() -> int:
 
     # 10g. Risk manager sizing approves a 1-lot IC at favourable credit.
     cache.delete(cache_key("paper:state", Segment.FNO))
+    # Same FIX #18 contamination guard as 9h — clear baseline + lockin
+    # before the test so a prior pollution doesn't skew sizing math.
+    cache.delete("risk:starting_equity:fno")
+    cache.delete("profit_lockin:fno")
     ic_rsk_broker = PaperBroker(segment=Segment.FNO)
     ic_rsk_broker._starting_cash = 50_000.0
     ic_rsk_broker._cash = 50_000.0
@@ -1125,6 +1139,10 @@ def main() -> int:
         return 1
     print(f"  ✓ Risk manager: 1-lot IC approved on ₹50K → qty={ic_decision.qty} "
           f"({ic_decision.reason})")
+    # Cleanup so the polluted ₹50K _starting_equity doesn't survive the
+    # test session.
+    cache.delete("risk:starting_equity:fno")
+    cache.delete("profit_lockin:fno")
 
     # 10h. Stock-options lot table extension: RELIANCE/INFY/HDFCBANK
     # resolve to non-zero lot sizes so stock F&O trading is reachable.
@@ -1508,6 +1526,11 @@ def main() -> int:
     # also writes ``instrument_kind`` / ``margin_blocked`` per-position
     # so the healthcheck and dashboard apply the same correction.
     cache.delete("paper:state:fno")
+    # Defensive: clear FIX #18 persisted baseline (even though this test
+    # path doesn't go through evaluate(), keeping the cleanup symmetric
+    # with the other FNO RiskManager tests prevents any future drift).
+    cache.delete("risk:starting_equity:fno")
+    cache.delete("profit_lockin:fno")
     fno_broker = PaperBroker(segment=Segment.FNO)
     starting = fno_broker.cash()  # always config-driven (₹100k)
 
@@ -1624,6 +1647,19 @@ def main() -> int:
                   f"{df.index.date.min()}…{df.index.date.max()}")
     except Exception as e:                                          # noqa: BLE001
         print(f"  ⚠ skip: NIFTY fetch failed (non-fatal): {e}")
+
+    # Final belt-and-braces cleanup: the regression suite uses test
+    # brokers with non-prod cash (₹50K) and non-prod positions. None of
+    # those should survive into Redis where the live bot would pick
+    # them up tomorrow. Sweep the F&O kill-switch + lockin keys one
+    # last time so a freshly-started F&O bot tomorrow morning captures
+    # its baseline from real configured capital, not test residue.
+    for k in ("risk:starting_equity:fno", "risk:starting_equity:equity",
+              "profit_lockin:fno", "profit_lockin:equity",
+              "paper:state:fno", "paper:state:equity",
+              "eod_done:fno", "eod_done:equity"):
+        cache.delete(k)
+    print("  (Redis test residue cleared.)")
 
     banner("✅ ALL FOURTEEN FIXES VERIFIED (incl. F&O EMA50 pre-warm — 2026-05-04 zero-trades)")
     return 0
