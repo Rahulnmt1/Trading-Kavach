@@ -1409,52 +1409,59 @@ if _hb and not is_market_open() and _hb_age is not None and _hb_age > 180:
         f"{int(_hb_age // 60)} min ago). They are not live."
     )
 
-# ── Hero P&L coherence check ─────────────────────────────────────────────────
-# The hero used to use the snapshot's ``daily_pnl_pct`` directly, which
-# the bot computes as ``(equity − _starting_equity) / _starting_equity``.
-# That's what drives the kill-switch and the profit-lock — so it's the
-# bot's BELIEF about today's P&L, but it can desync from the journal-
-# derived truth (realized + unrealized) in two ways:
-#   1. Cash leak from a pre-fix bug — the bot's equity reflects cash
-#      that may have been silently leaked, while the journal records
-#      the round-trip net correctly.
-#   2. ``_starting_equity`` captured at a moment when ``_equity()`` was
-#      transiently abnormal — every later P&L pct is then off by the
-#      same constant (this is the 2026-05-06 F&O "+100%" symptom).
+# ── Phantom-baseline guard ───────────────────────────────────────────────────
+# Earlier versions of this dashboard compared the bot's daily_pnl_pct
+# (computed off ``_equity() − _starting_equity``) against a naive
+# "journal-truth" of ``realized + unrealized`` and surfaced a banner on
+# any divergence. That was too noisy: the journal's ``net_pnl`` only
+# includes round-trip-completed trades, so entry fees on currently-open
+# positions live ENTIRELY in the bot's cash drop and never in the
+# journal-truth — which fired the banner on every open trade.
 #
-# We now display the journal-derived P&L as the headline and surface a
-# warning banner when the bot's belief and the journal disagree by more
-# than ₹100 OR 0.5% of capital. The progress bar and lockin banner
-# inside the hero still use the bot's belief (``_today_pnl_pct``)
-# because those reflect the SIDE the bot is actually acting on.
-_today_pnl_inr_truth = realized + unrealized
-_today_pnl_pct_truth = (_today_pnl_inr_truth / max(seg_capital.total, 1.0)) * 100
+# The bot's ``_equity()`` is the most accurate P&L number: it correctly
+# accounts for cash, cost basis, unrealized MTM, margin blocks, and
+# credit/fee flows. We trust it and display its number as the headline.
+#
+# The genuine risk we still need to defend against is the 2026-05-06
+# "+100% F&O phantom" — ``_starting_equity`` captured at a moment when
+# current equity was abnormal, leaving every later P&L pct off by a
+# huge constant. We catch that with a structural-impossibility check:
+# any reported daily P&L outside [−10%, +50%] cannot be a normal
+# trading outcome on a single day with the configured kill switch
+# (-2%) and lock-in (+5%). When that fires, the user gets the same
+# inspect+recover commands as before.
 _today_pnl_inr_belief = seg_capital.total * _today_pnl_pct / 100.0
-_pnl_divergence = abs(_today_pnl_inr_truth - _today_pnl_inr_belief)
-if _pnl_divergence > 100 or abs(_today_pnl_pct_truth - _today_pnl_pct) > 0.5:
-    st.warning(
-        f"⚠️ [{seg.label}] **P&L disagreement**: bot believes "
-        f"₹{_today_pnl_inr_belief:+,.2f} ({_today_pnl_pct:+.2f}%) but the "
-        f"journal + open-position MTM totals ₹{_today_pnl_inr_truth:+,.2f} "
-        f"({_today_pnl_pct_truth:+.2f}%). The bot's belief drives the "
-        f"kill-switch and the profit-lock — if it's wrong, the bot may "
-        f"have already locked in or halted on a phantom number. Inspect:"
-        f"\n\n```\n"
+_pnl_pct_implausible = (_today_pnl_pct < -10.0) or (_today_pnl_pct > 50.0)
+if _pnl_pct_implausible:
+    st.error(
+        f"🛑 [{seg.label}] **Implausible daily P&L**: "
+        f"₹{_today_pnl_inr_belief:+,.2f} ({_today_pnl_pct:+.2f}%) is "
+        f"outside the [-10%, +50%] range that any real trading day "
+        f"could produce on this bot (kill-switch -{seg_risk.max_daily_loss_pct}%, "
+        f"lock-in +{seg_risk.daily_profit_target_pct}%). Almost certainly "
+        f"the 2026-05-06 phantom-baseline pattern: ``_starting_equity`` "
+        f"was captured at an abnormal moment, every P&L pct is now off "
+        f"by a constant, and the kill-switch / profit-lock are running "
+        f"on a wrong number.\n\nInspect:\n\n```\n"
         f"redis-cli GET risk:starting_equity:{seg.value}\n"
         f"redis-cli GET profit_lockin:{seg.value}\n"
-        f"redis-cli GET paper:state:{seg.value}\n"
-        f"```\n\n"
+        f"redis-cli GET paper:state:{seg.value}\n```\n\n"
         f"To recover today (clears the wrong baseline + lockin, then "
-        f"restart the bot):\n\n"
-        f"```\nredis-cli DEL risk:starting_equity:{seg.value} "
+        f"restart the bot):\n\n```\n"
+        f"redis-cli DEL risk:starting_equity:{seg.value} "
         f"profit_lockin:{seg.value}\n```"
     )
 
 # ─────────────────────────── Hero KPI strip ──────────────────────────────────
+# Hero displays the bot's belief — it's the most accurate P&L number
+# (accounts for entry fees on open positions, margin offsets, etc) AND
+# it's what drives the kill-switch + profit-lock. Showing the same
+# number the bot is acting on means the dashboard never misleads about
+# what the bot will do next.
 render_hero_kpis(
     cash=cash, realized=realized, unrealized=unrealized,
     n_open=len(positions),
-    today_pnl_pct=_today_pnl_pct_truth,
+    today_pnl_pct=_today_pnl_pct,
     target_pct=seg_risk.daily_profit_target_pct,
     loss_cutoff_pct=seg_risk.max_daily_loss_pct,
     capital_total=seg_capital.total,
