@@ -397,8 +397,12 @@ def check_paper_state_clean() -> tuple[str, str, dict]:
         ps = cache.get_json(f"paper:state:{seg}") or {}
         cash = ps.get("cash")
         starting = ps.get("starting_capital")
+        ps_saved_at = (ps.get("saved_at") or "")[:10]
+        ps_is_stale = bool(ps_saved_at and ps_saved_at < today)
         if cash is not None and starting is not None:
             if starting and cash < -abs(starting):
+                # Apr-30 catastrophic — ALWAYS FAIL (real corruption,
+                # not a normal trading outcome on any timeline).
                 issues_apr30.append({
                     "segment": seg, "key": f"paper:state:{seg}",
                     "cash": cash, "starting_capital": starting,
@@ -407,8 +411,14 @@ def check_paper_state_clean() -> tuple[str, str, dict]:
             else:
                 cleanup_marker = ps.get("cleanup_marker", "")
                 n_positions = len(ps.get("positions", {}))
+                # Only fire May-04 phantom-short FAIL if the snapshot is
+                # from TODAY. A stale snapshot with cash < starting−₹1000
+                # is just yesterday's legitimate EOD close (e.g. the
+                # 2026-05-06 F&O -₹4,864 loss). PaperBroker._restore_state
+                # already discards stale snapshots on bot restart.
                 if (starting > 0 and (cash - starting) < -1000
-                        and n_positions == 0 and not cleanup_marker):
+                        and n_positions == 0 and not cleanup_marker
+                        and not ps_is_stale):
                     issues_may04.append({
                         "segment": seg, "key": f"paper:state:{seg}",
                         "cash": cash, "starting_capital": starting,
@@ -421,15 +431,34 @@ def check_paper_state_clean() -> tuple[str, str, dict]:
         pf = cache.get_json(f"portfolio:{seg}") or {}
         pf_cash = pf.get("cash")
         pf_starting = pf.get("starting_capital")
+        # If the portfolio snapshot's ts is from a PRIOR trading day,
+        # route ANY anomaly through the stale-portfolio (WARN) branch
+        # below — a real losing day legitimately shows
+        # ``cash - starting < -1000`` at EOD and would otherwise
+        # false-positive as the May-04 phantom-short signature on the
+        # next morning's preflight (caught 2026-05-07 when yesterday's
+        # legitimate -₹4,864 F&O loss tripped the gap-FAIL check).
+        # The Apr-30 catastrophic signature (``cash < -starting``) is
+        # NEVER a normal trading outcome, so we still let that fire
+        # FAIL even on stale snapshots — it always needs cleanup.
+        ts_raw = (pf.get("ts") or "")[:10]
+        pf_is_stale = bool(ts_raw and ts_raw < today)
         if pf_cash is not None and pf_starting is not None:
             if pf_starting and pf_cash < -abs(pf_starting):
+                # Apr-30 catastrophic — ALWAYS FAIL (real corruption,
+                # not a normal trading outcome on any timeline).
                 issues_apr30.append({
                     "segment": seg, "key": f"portfolio:{seg}",
                     "cash": pf_cash, "starting_capital": pf_starting,
                     "ts": pf.get("ts", ""),
                 })
             elif (pf_starting > 0 and (pf_cash - pf_starting) < -1000
-                    and not pf.get("cleanup_marker")):
+                    and not pf.get("cleanup_marker")
+                    and not pf_is_stale):
+                # May-04 phantom-short signature — only fire if the
+                # snapshot is from TODAY. A stale snapshot with the
+                # same gap is just yesterday's legitimate close;
+                # downgraded to WARN by the stale-portfolio branch.
                 issues_may04.append({
                     "segment": seg, "key": f"portfolio:{seg}",
                     "cash": pf_cash, "starting_capital": pf_starting,
@@ -441,8 +470,7 @@ def check_paper_state_clean() -> tuple[str, str, dict]:
         # a ts from a PRIOR date (i.e. yesterday's snapshot leaked
         # into today's dashboard). Don't fire if the cleanup_marker
         # is already set for the correct day.
-        ts_raw = (pf.get("ts") or "")[:10]
-        if ts_raw and ts_raw < today and not pf.get("cleanup_marker"):
+        if pf_is_stale and not pf.get("cleanup_marker"):
             issues_may05.append({
                 "segment": seg, "key": f"portfolio:{seg}",
                 "ts": pf.get("ts", ""), "today": today,
