@@ -6,6 +6,7 @@ should plug in a broker WebSocket feed (Zerodha KiteTicker, Dhan Marketfeed, etc
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
@@ -19,6 +20,68 @@ from .config import load_config
 from .logger import logger
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# FIX #27 — yfinance empty-bar retry + stale-cache fallback.
+#
+# yfinance intermittently returns empty payloads for both index tickers
+# (^NSEI / ^NSEBANK) and ordinary NSE equities — most aggressively on
+# the first 1-2 trading days after a weekend or NSE holiday, but also
+# in 1-2 min bursts mid-session at random. Empirical "No history"
+# warning counts per day from logs/bot_*.log:
+#
+#   2026-04-27 Mon  : 227  ← post-weekend Mon (worst case observed)
+#   2026-04-28 Tue  :   4
+#   2026-04-29 Wed  :   0
+#   2026-04-30 Thu  :   3
+#   2026-05-04 Mon  :   0  (counter-example — bursts are stochastic)
+#   2026-05-05 Tue  :  30
+#   2026-05-06 Wed  :  12
+#   2026-05-07 Thu  :   5
+#   2026-05-08 Fri  :   6
+#   2026-05-11 Mon  :  63  ← post-weekend Mon, drove F&O HOLD-all-day
+#   2026-05-12 Tue  :   0  (the burst can also skip the next day)
+#
+# Each burst was previously fatal for that minute's tick: F&O's
+# `option_buy_directional` needs ^NSEI 5m bars to compute EMA20/EMA50,
+# and on an empty fetch returned HOLD. If every poll happened to land
+# inside a burst (as on 2026-05-11), F&O produced zero signals all day.
+#
+# Mitigations layered here:
+#   1. ``history()`` now retries up to 3 times with backoff (0.5s, 1.5s,
+#      3.5s) on empty/exception. Most bursts last <2s — one retry is
+#      usually enough to get a populated response.
+#   2. ``intraday_bars()`` writes a longer-TTL ":stale" cache copy on
+#      every successful fetch, and falls back to it when the fresh
+#      fetch is empty. The fallback only fires if the last bar in the
+#      stale copy is within ONE BAR + 2 min of now — beyond that we
+#      return empty (no signal) so we never trade on materially stale
+#      data.
+#   3. A per-(symbol, interval, hour) dedup keeps the warning log from
+#      ballooning into 60+ identical lines per burst (yesterday it
+#      reached 63 in one day; with dedup the same day would emit ~6).
+_RETRY_DELAYS = (0.5, 1.5, 3.5)
+_STALE_CACHE_TTL = 900   # 15 min — long enough to bridge multi-min bursts
+_warning_dedup: dict[tuple[str, str, str], None] = {}
+
+
+def _warn_once(symbol: str, interval: str, message: str) -> None:
+    """Log a yfinance/empty-bar warning at most once per (symbol, interval, hour).
+
+    Loud enough to surface real outages, quiet enough that a 5-min
+    yfinance hiccup does not produce 60+ identical lines (the 2026-05-11
+    log signature). The dedup window resets every wall-clock hour, so a
+    recurring fault gets one fresh diagnostic each hour.
+    """
+    now = datetime.now(IST)
+    bucket = now.strftime("%Y-%m-%d %H")
+    key = (symbol, interval, bucket)
+    if key in _warning_dedup:
+        return
+    _warning_dedup[key] = None
+    if len(_warning_dedup) > 2048:
+        _warning_dedup.clear()
+        _warning_dedup[key] = None
+    logger.warning(message)
 
 
 @dataclass
@@ -77,12 +140,46 @@ def _interval_to_timedelta(interval: str) -> Optional[timedelta]:
 
 
 def history(symbol: str, days: int = 5, interval: str = "1m") -> pd.DataFrame:
-    """Fetch OHLCV. yfinance limits intraday lookback (~7 days for 1m)."""
-    ticker = yf.Ticker(to_yf(symbol))
+    """Fetch OHLCV. yfinance limits intraday lookback (~7 days for 1m).
+
+    FIX #27: retries up to 3 times with exponential backoff (0.5s,
+    1.5s, 3.5s — total worst-case 5.5s extra per failed fetch) when
+    yfinance returns an empty payload or raises. yfinance is known to
+    return spurious empty responses in 1-2 min bursts, especially on
+    Mondays after weekends — see the module-level FIX #27 note. A fresh
+    ``yf.Ticker`` is created per attempt to bypass any internal
+    "no-data" caching inside yfinance.
+    """
+    ticker_str = to_yf(symbol)
     period = f"{days}d"
-    df = ticker.history(period=period, interval=interval, prepost=False, auto_adjust=False)
+    df = pd.DataFrame()
+    last_exc: Optional[BaseException] = None
+    for attempt, delay in enumerate((0.0, *_RETRY_DELAYS), start=1):
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            ticker = yf.Ticker(ticker_str)
+            df = ticker.history(
+                period=period, interval=interval,
+                prepost=False, auto_adjust=False,
+            )
+        except Exception as exc:                                # noqa: BLE001
+            last_exc = exc
+            df = pd.DataFrame()
+            logger.debug(
+                "history({} {}): attempt {} raised {} — retrying",
+                symbol, interval, attempt, exc,
+            )
+            continue
+        if not df.empty:
+            break
     if df.empty:
-        logger.warning("No history for {}", symbol)
+        suffix = f" (last error: {last_exc})" if last_exc is not None else ""
+        _warn_once(
+            symbol, interval,
+            f"No history for {symbol} {interval} after "
+            f"{len(_RETRY_DELAYS) + 1} attempts (yfinance empty){suffix}",
+        )
         return df
     df = df.rename(columns=str.lower)
     df.index = df.index.tz_convert(IST) if df.index.tz else df.index.tz_localize("UTC").tz_convert(IST)
@@ -264,7 +361,44 @@ def intraday_bars(symbol: str, interval: str = "5m") -> pd.DataFrame:
     # F&O: keep prior 6 trading days + today so EMA50 has enough
     # warmup to emit signals from the open of today.
     if not df.empty:
-        cache.set_json(ck, df.to_json(orient="split", date_format="iso"), ttl=60)
+        payload = df.to_json(orient="split", date_format="iso")
+        cache.set_json(ck, payload, ttl=60)
+        # FIX #27: parallel ":stale" copy with a much longer TTL so the
+        # NEXT call inside a yfinance empty-bar burst can still serve
+        # near-fresh bars instead of forcing the strategy into HOLD.
+        cache.set_json(f"{ck}:stale", payload, ttl=_STALE_CACHE_TTL)
+        return df
+    # FIX #27: fresh fetch returned EMPTY (yfinance burst). Fall back
+    # to the stale-cache copy if it exists AND the last bar is fresh
+    # enough that we're not trading on a materially old picture. The
+    # cutoff is ``interval + 2 min`` — i.e. at most one missed bar.
+    stale_raw = cache.get_json(f"{ck}:stale")
+    if not stale_raw:
+        return df  # empty — caller will skip this symbol for the tick
+    df = pd.read_json(StringIO(stale_raw), orient="split")
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert(IST)
+    if df.empty:
+        return df
+    interval_td = _interval_to_timedelta(interval) or timedelta(minutes=5)
+    cutoff = interval_td + timedelta(minutes=2)
+    last_bar_age = datetime.now(IST) - df.index[-1].to_pydatetime()
+    if last_bar_age > cutoff:
+        _warn_once(
+            symbol, interval,
+            f"[data] {symbol} {interval} empty AND stale cache too old "
+            f"({last_bar_age.total_seconds():.0f}s > "
+            f"{int(cutoff.total_seconds())}s cutoff) — returning empty",
+        )
+        return pd.DataFrame()
+    _warn_once(
+        symbol, interval,
+        f"[data] {symbol} {interval} bars empty from yfinance — serving "
+        f"stale cache (last bar {last_bar_age.total_seconds():.0f}s old, "
+        f"within {int(cutoff.total_seconds())}s cutoff)",
+    )
     return df
 
 

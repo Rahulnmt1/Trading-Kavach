@@ -817,11 +817,58 @@ def maker_run_regression_suite() -> tuple[str, str, dict]:
     except Exception as e:                                       # noqa: BLE001
         return (Status.FAIL, f"could not import bot.healthcheck: {e}", {"fix": "15"})
 
+    # ── FIX #27 — yfinance empty-bar retry + stale-cache fallback ───────
+    # On 2026-05-11 (post-weekend Mon) the F&O bot emitted ZERO signals
+    # because yfinance returned empty payloads for ^NSEI / ^NSEBANK in
+    # 1-2 min bursts that compounded across the day (63 "No history"
+    # warnings in the bot log). Three-layer fix:
+    #   1. bot.data.history retries up to 3× with backoff on empty.
+    #   2. bot.data.intraday_bars writes a parallel ":stale" cache copy
+    #      and falls back to it when fresh fetch is empty.
+    #   3. bot.data._warn_once dedups identical warnings per-hour so a
+    #      sustained burst produces ~6 lines/day instead of 63+.
+    try:
+        from bot.data import history as _history_fn
+    except Exception as e:                                       # noqa: BLE001
+        return (Status.FAIL, f"could not import bot.data: {e}", {"fix": "27"})
+    hist_src = inspect.getsource(_history_fn)
+    if "_RETRY_DELAYS" not in hist_src or "time.sleep" not in hist_src:
+        return (Status.FAIL,
+                "FIX #27 regressed: bot.data.history no longer retries on "
+                "empty yfinance responses. The 2026-05-11 F&O HOLD-all-day "
+                "scenario can recur — option_buy_directional will return "
+                "HOLD on every yfinance hiccup.",
+                {"fix": "27"})
+    ib_src2 = inspect.getsource(intraday_bars)
+    if ":stale" not in ib_src2 or "_STALE_CACHE_TTL" not in ib_src2:
+        return (Status.FAIL,
+                "FIX #27 regressed: bot.data.intraday_bars no longer writes "
+                "the ':stale' cache copy. Strategies will starve on "
+                "transient yfinance empty-bar bursts.",
+                {"fix": "27"})
+    if "cutoff" not in ib_src2 or "interval_td" not in ib_src2:
+        return (Status.FAIL,
+                "FIX #27 regressed: bot.data.intraday_bars stale-fallback "
+                "no longer enforces the bar-age cutoff. Strategies could "
+                "trade on materially stale data.",
+                {"fix": "27"})
+    try:
+        from bot import data as _data_mod
+    except Exception as e:                                       # noqa: BLE001
+        return (Status.FAIL, f"could not import bot.data: {e}", {"fix": "27"})
+    if not hasattr(_data_mod, "_warn_once") or not hasattr(_data_mod, "_warning_dedup"):
+        return (Status.FAIL,
+                "FIX #27 regressed: bot.data._warn_once / _warning_dedup "
+                "removed — empty-bar bursts will spam the log (63 "
+                "lines/day signature from 2026-05-11).",
+                {"fix": "27"})
+
     return (Status.PASS,
             "FIX #12 (synthetic pricing) + FIX #13 (EOD race + over-sell) + "
-            "FIX #14 (F&O EMA50 pre-warm) + FIX #15 (F&O-aware daily-loss) pinned",
-            {"checks": len(cases) + 2 + 4 + 2 + 4,
-             "fixes_pinned": ["12", "13a", "13b", "14", "15"]})
+            "FIX #14 (F&O EMA50 pre-warm) + FIX #15 (F&O-aware daily-loss) + "
+            "FIX #27 (yfinance retry + stale-cache) pinned",
+            {"checks": len(cases) + 2 + 4 + 2 + 4 + 4,
+             "fixes_pinned": ["12", "13a", "13b", "14", "15", "27"]})
 
 
 # ─── Phase 3 (Decision checkers) — read post-maker state ────────────────────

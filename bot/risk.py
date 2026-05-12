@@ -37,6 +37,23 @@ class RiskDecision:
     reason: str = ""
 
 
+class RiskConfigError(ValueError):
+    """Raised at RiskManager construction when the segment's risk caps
+    are structurally unsafe — i.e. the bot is configured to allow more
+    cumulative loss across simultaneously-open trades than the daily
+    kill-switch budget. See :meth:`RiskManager._verify_risk_invariants`
+    for the exact check.
+
+    This is a startup error, not a runtime warning, because the sizing
+    code in :meth:`RiskManager.evaluate` reads these caps on every
+    signal — once the bot is running on an unsafe ratio it WILL size a
+    single trade past the daily cap (the 2026-05-07 incident: per_trade
+    5% × open 5 = 25% potential simultaneous SL on a 2% daily-loss
+    budget; the iron-condor sizer used the per-trade cap to allocate
+    6 lots/IC and exposed ₹8,864 (8.8% of capital) on two ICs).
+    """
+
+
 class RiskManager:
     def __init__(self, broker: Broker, segment: Segment = Segment.EQUITY) -> None:
         self.broker = broker
@@ -46,6 +63,11 @@ class RiskManager:
         # ``capital`` / ``risk``; F&O reads ``fno.capital`` / ``fno.risk``.
         self._capital_cfg = cfg_capital(self.cfg, segment)
         self._risk_cfg = cfg_risk(self.cfg, segment)
+        # FIX #22 (2026-05-07): refuse to start if the loaded risk caps
+        # would let the sizer allocate a position whose stop-loss alone
+        # exceeds the daily kill-switch. See the docstring on
+        # ``_verify_risk_invariants`` for the rationale.
+        self._verify_risk_invariants()
         self._cache = get_cache()
         self._equity_key = cache_key("risk:starting_equity", segment)
         self._trades_today = 0
@@ -75,6 +97,66 @@ class RiskManager:
                     "[risk:{}] restored starting_equity=₹{:,.2f} for {}",
                     segment.value, self._starting_equity, self._day,
                 )
+
+    def _verify_risk_invariants(self) -> None:
+        """Refuse to start if the configured risk caps are structurally
+        unsafe.
+
+        The invariant we enforce:
+
+            max_loss_per_trade_pct × max_open_positions ≤ max_daily_loss_pct
+
+        Reasoning. The position sizer in :meth:`evaluate` allocates qty
+        such that ``risk_per_share × qty ≈ capital × max_loss_per_trade_pct``
+        — i.e. each trade's SL hit costs at most ``max_loss_per_trade_pct``
+        of capital. With ``max_open_positions`` simultaneous trades, a
+        synchronised stop-out across all of them costs the *product* of
+        those caps. If that product exceeds ``max_daily_loss_pct``, the
+        kill-switch threshold can be punched through by a single market
+        move that knocks out every open position at once, with no
+        opportunity for the daily-loss cap to halt new entries (no new
+        entries are needed — the existing book alone breaches it).
+
+        2026-05-07 incident — the realised version of this:
+
+          F&O config had per_trade=5.0% × open=5 = 25% potential
+          simultaneous SL on a 2% daily-loss budget. The IC sizer used
+          the per-trade cap to allocate 6 lots/IC; two ICs open at
+          11:10 IST exposed ₹8,864 (8.8% of capital) at SL — 4.4× the
+          daily kill-switch. We squared off manually for a realised
+          -₹528 vs that ₹8,864 tail.
+
+        We raise :class:`RiskConfigError` rather than just logging a
+        warning, because the failure mode is silent at runtime — the
+        sizer happily allocates the unsafe size and the operator only
+        finds out when the dashboard's Net @ SL column shows a tail
+        bigger than the daily cap.
+        """
+        per_trade = float(self._risk_cfg.max_loss_per_trade_pct)
+        daily_cap = float(self._risk_cfg.max_daily_loss_pct)
+        open_cap = int(self._risk_cfg.max_open_positions)
+        product = per_trade * open_cap
+        # Allow a tiny float-comparison fudge so 1.0 × 2 == 2.0 doesn't
+        # fail to a 2.0000000004 representation.
+        if product > daily_cap + 1e-9:
+            msg = (
+                f"[risk:{self.segment.value}] STRUCTURAL RISK CONFIG ERROR — "
+                f"max_loss_per_trade_pct ({per_trade}%) × max_open_positions "
+                f"({open_cap}) = {product:.2f}% exceeds max_daily_loss_pct "
+                f"({daily_cap}%). At this ratio a synchronised SL on every "
+                f"open trade would breach the daily kill-switch with no "
+                f"opportunity for the daily-loss cap to halt new entries. "
+                f"Edit config.yaml so per_trade × open ≤ daily_cap "
+                f"(e.g. per_trade=1.0, open=2 → 2.0% ≤ 2.0%) and restart. "
+                f"See FIX #22 in bot/risk.py::_verify_risk_invariants."
+            )
+            logger.error(msg)
+            raise RiskConfigError(msg)
+        logger.info(
+            "[risk:{}] risk-invariant OK: per_trade {}% × open {} = "
+            "{:.2f}% ≤ daily_cap {}%",
+            self.segment.value, per_trade, open_cap, product, daily_cap,
+        )
 
     def _load_starting_equity(self) -> Optional[float]:
         snap = self._cache.get_json(self._equity_key)

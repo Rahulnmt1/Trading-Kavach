@@ -965,7 +965,24 @@ def main() -> int:
     # approving 3 lots given the 21/share stop, which is the correct
     # behaviour for a 100K account but not what this test wants to verify.
     risk_mgr._capital_cfg.total = 50_000.0
-    decision = risk_mgr.evaluate(favourable_sig)
+    # FIX #25-test (2026-05-07): the post-FIX-#22 production cap is
+    # max_loss_per_trade_pct=1.0, which yields max_loss_budget=₹500 on
+    # ₹50K and risk_qty=23 — below the lot of 75, so the test's
+    # "1-lot spread on ₹50K" stated intent fails through no fault of
+    # the spread sizer. We temporarily widen the per-trade pct AFTER
+    # construction (so the live invariant check at __init__ still
+    # validated the loaded config), and restore it before exiting the
+    # block so the IC test that follows sees the production caps when
+    # IT runs its own RiskManager.__init__ (the dataclass returned by
+    # ``cfg_risk()`` is a *shared* singleton — mutating it would leak
+    # into the next test's invariant check and crash with "5.0 × 2 =
+    # 10.0 > daily_cap 2.0").
+    _saved_per_trade = risk_mgr._risk_cfg.max_loss_per_trade_pct
+    try:
+        risk_mgr._risk_cfg.max_loss_per_trade_pct = 5.0
+        decision = risk_mgr.evaluate(favourable_sig)
+    finally:
+        risk_mgr._risk_cfg.max_loss_per_trade_pct = _saved_per_trade
     if not decision.allow or decision.qty != 75:
         print(f"  ✗ FAILED — risk manager rejected 1-lot spread on ₹50K: allow={decision.allow}, "
               f"qty={decision.qty}, reason={decision.reason!r}")
@@ -1131,7 +1148,17 @@ def main() -> int:
         reason="(test) high-credit ATM IC",
     )
     ic_risk_mgr = RiskManager(ic_rsk_broker, segment=Segment.FNO)
-    ic_decision = ic_risk_mgr.evaluate(ic_sig)
+    ic_risk_mgr._capital_cfg.total = 50_000.0
+    # FIX #25-test (2026-05-07): see the matching note in 9h above —
+    # the post-FIX-#22 per-trade cap of 1.0% can't fit a single lot of
+    # 75 on ₹50K with the 21/share IC stop. Save / restore so we don't
+    # pollute downstream tests via the shared cfg dataclass instance.
+    _saved_per_trade_ic = ic_risk_mgr._risk_cfg.max_loss_per_trade_pct
+    try:
+        ic_risk_mgr._risk_cfg.max_loss_per_trade_pct = 5.0
+        ic_decision = ic_risk_mgr.evaluate(ic_sig)
+    finally:
+        ic_risk_mgr._risk_cfg.max_loss_per_trade_pct = _saved_per_trade_ic
     if not ic_decision.allow or ic_decision.qty != 75:
         print(f"  ✗ FAILED — risk manager rejected 1-lot IC on ₹50K: "
               f"allow={ic_decision.allow}, qty={ic_decision.qty}, "
@@ -1312,6 +1339,31 @@ def main() -> int:
     cfg = load_config()
     cache.delete("eod_done:equity")
     cache.delete("paper:state:equity")
+
+    # ── Test isolation: redirect journal writes to a tmpdir ───────────
+    # FIX (2026-05-08): the `_FakeExecutor` block below triggers a real
+    # `Executor._end_of_day` call, which closes a long FOO position and
+    # writes a `TRADE_CLOSED` event into ``logs/trades/equity/<TODAY>.jsonl``.
+    # On 2026-05-08 morning this leaked into the LIVE journal file and
+    # the operator opened the dashboard pre-market to see a phantom
+    # -₹8.21 "today's loss" from the test's fake FOO trade. The fix:
+    # monkey-patch `bot.journal._logs_root` to point at a tmpdir for the
+    # duration of FIX #13 so journal writes go nowhere production reads.
+    # Restored at the cleanup right before the FIX #15 banner.
+    import tempfile, shutil
+    import bot.journal as _journal_mod
+    _journal_tmpdir = tempfile.mkdtemp(prefix="bot-test-journal-")
+    _orig_logs_root = _journal_mod._logs_root
+
+    def _patched_logs_root(segment: Segment = Segment.EQUITY):
+        from pathlib import Path
+        p = Path(_journal_tmpdir)
+        sub = _journal_mod.journal_subdir(segment)
+        (p / "trades" / sub).mkdir(parents=True, exist_ok=True)
+        (p / "eod" / sub).mkdir(parents=True, exist_ok=True)
+        return p
+
+    _journal_mod._logs_root = _patched_logs_root
 
     # (b) Over-sell guard — refined 2026-05-05 to permit fresh strategy
     # shorts on a flat book (legitimate intraday MIS shorting), while
@@ -1509,6 +1561,10 @@ def main() -> int:
     cache.delete("eod_done:equity")
     cache.delete("paper:state:equity")
 
+    # Restore the live journal root + delete the tmpdir.
+    _journal_mod._logs_root = _orig_logs_root
+    shutil.rmtree(_journal_tmpdir, ignore_errors=True)
+
     # ─────────────────────────────────────────────────────────────────────
     banner("FIX #15 — daily-loss formula excludes margin block (2026-05-05 PM kill-switch trip)")
     # On 2026-05-05 13:26 the F&O bot opened two NIFTY/BANKNIFTY put
@@ -1648,6 +1704,126 @@ def main() -> int:
     except Exception as e:                                          # noqa: BLE001
         print(f"  ⚠ skip: NIFTY fetch failed (non-fatal): {e}")
 
+    # ─────────────────────────────────────────────────────────────────────
+    banner("FIX #27 — yfinance empty-bar retry + stale-cache fallback (2026-05-11 F&O HOLD-all-day)")
+    # On 2026-05-11 (Monday after weekend) the F&O bot emitted ZERO
+    # signals all day despite a clean +0.4% NIFTY move. Root cause:
+    # yfinance returned spurious EMPTY payloads for ^NSEI / ^NSEBANK /
+    # equity tickers in 1-2 min bursts at 10:41, 12:01-12:09, 13:42-
+    # 13:47, 15:54 IST. 63 "No history" warnings landed in
+    # ``bot_2026-05-11.log``; every burst forced
+    # ``option_buy_directional`` into HOLD because EMA20/EMA50 cannot
+    # be computed on an empty DataFrame. Empirical pattern observed
+    # across 11 trading days: warning counts are stochastic but heavily
+    # skewed to post-weekend Mondays (227 on 2026-04-27, 63 on
+    # 2026-05-11, vs single-digit counts mid-week).
+    #
+    # Three-layer fix in ``bot/data.py``:
+    #   1. ``history()`` retries up to 3 times with backoff (0.5s,
+    #      1.5s, 3.5s) on empty/exception. Most bursts are <2s so the
+    #      first retry usually succeeds.
+    #   2. ``intraday_bars()`` writes a parallel ``:stale`` cache copy
+    #      with a 15-min TTL on every successful fetch and falls back
+    #      to it when the fresh fetch is empty. The fallback only
+    #      fires if the last cached bar is within ``interval + 2 min``
+    #      of now (≤7 min for the 5m timeframe) — beyond that we
+    #      return empty so we never trade on materially stale data.
+    #   3. ``_warn_once`` dedups identical warnings to one per
+    #      (symbol, interval, hour). The same burst that produced 63
+    #      lines on 2026-05-11 would produce ~6 with this dedup.
+    import inspect
+    from bot import data as _data_mod
+    hist_src = inspect.getsource(_data_mod.history)
+    if "_RETRY_DELAYS" not in hist_src or "time.sleep" not in hist_src:
+        print("  ✗ FAILED — bot/data.py::history no longer retries on empty "
+              "yfinance responses. The 2026-05-11 F&O HOLD-all-day bug "
+              "(63 empty-bar warnings) can recur.")
+        return 1
+    if "yf.Ticker(ticker_str)" not in hist_src:
+        print("  ✗ FAILED — history() no longer re-creates the yf.Ticker "
+              "object per attempt. yfinance can cache a 'no-data' verdict "
+              "on the Ticker instance and serve stale empties.")
+        return 1
+    print("  ✓ history() retries empty yfinance fetches via _RETRY_DELAYS + time.sleep")
+    ib_src = inspect.getsource(_data_mod.intraday_bars)
+    if ":stale" not in ib_src or "_STALE_CACHE_TTL" not in ib_src:
+        print("  ✗ FAILED — intraday_bars no longer writes the :stale cache "
+              "copy. Strategies will starve on transient yfinance bursts.")
+        return 1
+    if "cutoff" not in ib_src or "interval_td" not in ib_src:
+        print("  ✗ FAILED — intraday_bars stale-fallback no longer enforces "
+              "the bar-age cutoff. Strategies could trade on materially "
+              "stale data.")
+        return 1
+    print("  ✓ intraday_bars writes :stale cache + enforces bar-age cutoff")
+    # ``_warn_once`` dedup keeps the log clean during sustained bursts.
+    if not hasattr(_data_mod, "_warn_once") or not hasattr(_data_mod, "_warning_dedup"):
+        print("  ✗ FAILED — bot.data._warn_once / _warning_dedup missing. "
+              "Empty-bar bursts will spam the log (63 lines/day signature).")
+        return 1
+    print("  ✓ _warn_once + _warning_dedup present (per-hour log dedup)")
+
+    # Functional check: monkey-patch ``history`` to return empty AND
+    # prime the ``:stale`` cache → ``intraday_bars`` must serve the
+    # stale rows. We use a synthetic symbol so we never collide with
+    # any real NIFTY/equity bars already in Redis.
+    import pandas as _pd
+    _TEST_SYM = "__FIX27_TEST__"
+    _ck = f"bars2:{_TEST_SYM}:5m"
+
+    def _build_fake(end_ts):
+        idx = _pd.date_range(end=end_ts, periods=60, freq="5min", tz=IST)
+        return _pd.DataFrame({
+            "open":   [100.0] * 60,
+            "high":   [101.0] * 60,
+            "low":    [ 99.0] * 60,
+            "close":  [100.5] * 60,
+            "volume": [1000]  * 60,
+        }, index=idx)
+
+    _orig_history = _data_mod.history
+    def _empty_history(symbol, days=5, interval="1m"):
+        return _pd.DataFrame()
+    _data_mod.history = _empty_history
+    try:
+        # (a) Fresh stale copy — last bar 1 min old → must be served.
+        fresh_stale = _build_fake(
+            datetime.now(IST).replace(second=0, microsecond=0)
+            - timedelta(minutes=1),
+        )
+        cache.delete(_ck)
+        cache.set_json(f"{_ck}:stale",
+                       fresh_stale.to_json(orient="split", date_format="iso"),
+                       ttl=900)
+        result = _data_mod.intraday_bars(_TEST_SYM, "5m")
+        if result is None or result.empty:
+            print(f"  ✗ FAILED — intraday_bars returned empty when stale "
+                  f"cache had 60 fresh rows. Stale-fallback path is "
+                  f"broken; 2026-05-11 F&O HOLD-all-day can recur.")
+            return 1
+        print(f"  ✓ intraday_bars served {len(result)} stale rows when "
+              f"yfinance returned empty (the 2026-05-11 burst path)")
+
+        # (b) Old stale copy — last bar 30 min old, beyond 7-min cutoff
+        # for 5m bars → must NOT serve.
+        old_stale = _build_fake(datetime.now(IST) - timedelta(minutes=30))
+        cache.delete(_ck)
+        cache.set_json(f"{_ck}:stale",
+                       old_stale.to_json(orient="split", date_format="iso"),
+                       ttl=900)
+        result2 = _data_mod.intraday_bars(_TEST_SYM, "5m")
+        if result2 is not None and not result2.empty:
+            print(f"  ✗ FAILED — intraday_bars served stale rows whose last "
+                  f"bar was 30 min old, beyond the 7-min cutoff. "
+                  f"Strategies could trade on materially stale data.")
+            return 1
+        print(f"  ✓ intraday_bars refuses to serve stale rows beyond the "
+              f"bar-age cutoff (returns empty instead)")
+    finally:
+        _data_mod.history = _orig_history
+        cache.delete(_ck)
+        cache.delete(f"{_ck}:stale")
+
     # Final belt-and-braces cleanup: the regression suite uses test
     # brokers with non-prod cash (₹50K) and non-prod positions. None of
     # those should survive into Redis where the live bot would pick
@@ -1661,7 +1837,7 @@ def main() -> int:
         cache.delete(k)
     print("  (Redis test residue cleared.)")
 
-    banner("✅ ALL FOURTEEN FIXES VERIFIED (incl. F&O EMA50 pre-warm — 2026-05-04 zero-trades)")
+    banner("✅ ALL FIFTEEN FIXES VERIFIED (incl. FIX #27 — yfinance retry + stale-cache)")
     return 0
 
 

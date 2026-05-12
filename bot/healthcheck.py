@@ -618,7 +618,26 @@ def _in_trading_window(now: datetime, cfg) -> bool:
 
 def _build_summary(checks: List[CheckResult],
                    segment: Segment = Segment.EQUITY) -> Dict[str, Any]:
-    """One-line metrics block surfaced beneath the per-check list."""
+    """One-line metrics block surfaced beneath the per-check list.
+
+    The equity formula MUST stay in lockstep with
+    :meth:`bot.risk.RiskManager._equity` — otherwise the dashboard gets
+    two contradictory P&L numbers (the per-check ``Portfolio & risk``
+    line uses the bot's `_equity` via the published snapshot, while
+    this summary historically reconstructed equity from positions
+    independently). The pre-FIX-#22 implementation here used
+    ``cash + long_basis + unrealized`` only, which on an IRON_CONDOR
+    book showed a phantom ``+32.34%`` because the credit collected at
+    entry inflated cash without the offsetting ``margin − credit``
+    contribution that the risk manager's :meth:`_equity` correctly
+    subtracts. The 2026-05-07 healthcheck SUMMARY block displayed
+    ``Equity ₹132,342.89 (+32.34%)`` while the same record's
+    ``Portfolio & risk`` check correctly showed ``₹99,865 (-0.14%)`` —
+    a head-scratcher that rendered the dashboard untrustworthy.
+
+    The formula below mirrors :meth:`RiskManager._equity` exactly so
+    the two paths can never diverge again.
+    """
     cfg = load_config()
     capital_total = cfg_capital(cfg, segment).total
     risk = cfg_risk(cfg, segment)
@@ -631,7 +650,28 @@ def _build_summary(checks: List[CheckResult],
     long_basis = sum((p.get("avg_price", 0) or 0) * (p.get("qty", 0) or 0)
                      for p in positions if (p.get("qty", 0) or 0) > 0)
     unreal = sum(p.get("unrealized_pnl", 0) or 0 for p in positions)
-    equity = cash + long_basis + unreal
+    # FIX #22 (2026-05-07): margin offset for FUTURES / SPREAD /
+    # IRON_CONDOR — same logic as RiskManager._equity. Without this,
+    # short credit-spreads / iron-condors land their credit in cash
+    # without the offsetting margin block, inflating equity by exactly
+    # the credit received (~+32% phantom on a 2-IC book). For futures,
+    # ``margin_blocked`` is debited from cash at entry and refunded at
+    # close, so it must be added back. For short SPREAD / IC, cash flow
+    # at entry is ``+credit - margin``, so the position contributes
+    # ``margin - credit`` to equity (which goes to zero when the spread
+    # is closed at its entry net price — exactly the right behaviour).
+    margin_offset = 0.0
+    for p in positions:
+        kind = (p.get("instrument_kind") or "EQUITY").upper()
+        margin = float(p.get("margin_blocked") or 0.0)
+        qty = int(p.get("qty") or 0)
+        avg_price = float(p.get("avg_price") or 0.0)
+        if kind == "FUTURES":
+            margin_offset += margin
+        elif kind in ("SPREAD", "IRON_CONDOR") and qty < 0:
+            credit_received = avg_price * abs(qty)
+            margin_offset += margin - credit_received
+    equity = cash + long_basis + unreal + margin_offset
     return {
         "Segment":          segment.label,
         "Capital":          f"₹{capital_total:,.2f}",

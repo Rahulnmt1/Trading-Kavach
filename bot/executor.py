@@ -100,6 +100,28 @@ class Executor:
         # written by ``_lock_in_for_day`` and stamped with the wall-clock
         # date; we honour it only if it was created today (IST).
         self._profit_locked: bool = self._restore_profit_lock()
+        # Phase-1 idle marker for empty-ensemble segments (FIX #24,
+        # 2026-05-07): logged once per day so the operator can tell a
+        # legitimate idle bot from a hung tick. Until 2026-05-07 these
+        # two lines lived AFTER the ``return False`` in
+        # ``_restore_profit_lock`` (i.e. dead code that referenced
+        # ``segment`` / ``broker_name`` from __init__'s scope), which
+        # meant ``self._idle_logged_for_day`` was never set as an
+        # attribute and the "Executor ready" log line never fired. The
+        # AttributeError was dormant because every segment we ship today
+        # has at least one ensemble member registered, but a future
+        # paused F&O config (``fno.strategies.enabled: []``) would have
+        # crashed every tick at ``self._idle_logged_for_day != today``.
+        self._idle_logged_for_day: Optional[datetime] = None
+        # Per-(symbol,reason) suppression for already-in-position style
+        # rejections (FIX #26). Without this, a credit-spread / IC kept
+        # alive across many ticks emitted the same REJECTED log every
+        # minute (38 lines today between 10:27 and 11:04). We log once
+        # per (symbol, reason) per day; the rest of the day stays quiet.
+        self._rejection_logged: set[tuple[str, str]] = set()
+        logger.info("Executor [{}] ready: broker={}, strategies={}, live={}, ws={}, notify={}",
+                    segment.value, broker_name, [m.name for m in self.ensemble.members],
+                    env().LIVE_TRADING, self.feed is not None, self.notifier.enabled)
 
     def _restore_profit_lock(self) -> bool:
         snap = self.cache.get_json(self._profit_lock_key)
@@ -122,13 +144,6 @@ class Executor:
         # starts clean.
         self.cache.delete(self._profit_lock_key)
         return False
-        # F&O Phase 1 has no strategies registered yet; we log a clear
-        # idle marker on the FIRST tick so the operator sees it but
-        # don't spam the log every minute thereafter.
-        self._idle_logged_for_day: Optional[datetime] = None
-        logger.info("Executor [{}] ready: broker={}, strategies={}, live={}, ws={}, notify={}",
-                    segment.value, broker_name, [m.name for m in self.ensemble.members],
-                    env().LIVE_TRADING, self.feed is not None, self.notifier.enabled)
 
     def _maybe_start_feed(self, broker_name: str):
         """Start KiteTicker WebSocket if available; fall back to polled bars."""
@@ -206,9 +221,14 @@ class Executor:
         # Roll over the profit-lock flag at the start of each new trading day.
         # (Compares against the risk manager's tracked day so both modules
         # stay in sync.)
-        if self._profit_locked and self.risk._day != now.date():
-            self._profit_locked = False
-            self.cache.delete(self._profit_lock_key)
+        if self.risk._day != now.date():
+            if self._profit_locked:
+                self._profit_locked = False
+                self.cache.delete(self._profit_lock_key)
+            # Reset the per-day rejection-log suppression set so a
+            # recurring rejection prints one fresh diagnostic per day
+            # instead of staying silent forever after first hit. (FIX #26)
+            self._reset_rejection_log()
 
         if self.risk.should_square_off(now.time()):
             self._end_of_day()
@@ -276,12 +296,24 @@ class Executor:
         self.broker.update_marks(marks)
 
         # ── 4. Risk + place new entries ──────────────────────────────────
+        # Pre-filter: skip signals for symbols already in our open book.
+        # Without this, a strategy that legitimately keeps re-emitting
+        # the same signal each tick (the iron-condor flat-regime detector
+        # is the canonical case — flatness < threshold persists for
+        # tens of minutes once a consolidation regime forms) spams the
+        # log with one "REJECTED: already in position" line per minute.
+        # 2026-05-07 had 38 such lines on a SINGLE NIFTY IC between
+        # 10:27 and 11:04 IST. The risk gate will still catch this
+        # rejection if the pre-filter ever misses, but the pre-filter
+        # is the cheaper, quieter path. (FIX #26)
+        held_symbols = {p.symbol for p in self.broker.positions() if p.qty != 0}
         for sig in signals:
             if sig.type == SignalType.HOLD:
                 continue
+            if sig.symbol in held_symbols:
+                continue
             decision = self.risk.evaluate(sig)
-            logger.info("[risk] {} {} -> {}: {}", sig.symbol, sig.type.value,
-                        "APPROVED" if decision.allow else "REJECTED", decision.reason)
+            self._log_risk_decision(sig, decision)
             if not decision.allow:
                 self.notifier.rejection(sig, decision.reason)
                 continue
@@ -294,6 +326,36 @@ class Executor:
                 self.risk.record_trade()
 
         self._publish_state()
+
+    def _log_risk_decision(self, sig: Signal, decision) -> None:
+        """One-line log for the risk-gate decision, with first-occurrence
+        suppression for repetitive REJECTED reasons.
+
+        APPROVED is always logged (rare and important — the trade
+        actually goes to the broker next). REJECTED is logged the first
+        time per (symbol, reason) per process; subsequent identical
+        rejections are silent. The set is reset by ``_reset_rejection_log``
+        each new trading day so a recurring condition gets one fresh
+        line tomorrow morning. (FIX #26)
+        """
+        verb = "APPROVED" if decision.allow else "REJECTED"
+        if decision.allow:
+            logger.info("[risk] {} {} -> {}: {}", sig.symbol,
+                        sig.type.value, verb, decision.reason)
+            return
+        # Truncate the reason to a stable token so different qty=0
+        # explanations (which include live numeric counters) collapse.
+        key = (sig.symbol, decision.reason.split(".")[0][:80])
+        if key in self._rejection_logged:
+            return
+        self._rejection_logged.add(key)
+        logger.info("[risk] {} {} -> {}: {}", sig.symbol,
+                    sig.type.value, verb, decision.reason)
+
+    def _reset_rejection_log(self) -> None:
+        """Called from ``_end_of_day`` so the per-day suppression set
+        rolls over cleanly on the next session."""
+        self._rejection_logged.clear()
 
     # ============================================================
     #  Position management (SL / TP / trailing stop)

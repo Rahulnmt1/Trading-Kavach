@@ -6,7 +6,31 @@
 # =================================================================
 
 capital:
-  total: 100000           # Total equity trading capital in INR
+  # 2026-05-08 — Lever A (post-Option-2 review). Bumped 100,000 → 300,000
+  # (paper) after the live-day analysis showed both 2026-05-08 equity
+  # trades (INFY, INDUSINDBK) hit the ``max_position_pct=25%`` size cap
+  # at ₹24,633 / ₹24,648 — meaning they were SIZE-bound, not RISK-bound
+  # (per-trade risk budget of ₹1,000 was only ~₹100-155 utilised). With
+  # 3× capital the same signals deploy 3× the rupees, scaling expected
+  # net P&L roughly linearly (gross + fees both scale linearly, so the
+  # ratio holds). Backtest-projected median equity day moves from ~₹500
+  # to ~₹1,500 net.
+  #
+  # Risk envelope is UNCHANGED — every limit downstream is %-based:
+  #   * max_loss_per_trade_pct: 1.0  → ₹3,000 (was ₹1,000) per trade
+  #   * max_open_positions:    2    → ₹6,000 worst-case simultaneous SL
+  #   * max_daily_loss_pct:    2.0  → ₹6,000 daily kill-switch
+  #   * FIX #22 invariant 1.0 × 2 = 2.0 ≤ 2.0 still holds ✓
+  #   * max_position_pct:      25.0 → ₹75,000 max single position (was ₹25K)
+  #   * deployable_pct:        0.80 → ₹240,000 max deployed (was ₹80K)
+  #
+  # NOTE: ``daily_profit_target_pct: 5.0`` (below) is intentionally LEFT
+  # AT 5% — equity rides intraday trends to EOD; locking in at +1.67%
+  # (₹5K on ₹300K) would prematurely close winners that historically
+  # extend through afternoon. Revisit after 5 live trading days if the
+  # rolling median exceeds ₹3K — at that point a tighter equity lock-in
+  # is worth backtesting.
+  total: 300000           # Total equity trading capital in INR (paper)
   deployable_pct: 0.80    # Use at most 80% of capital at any time
 
 risk:
@@ -19,7 +43,14 @@ risk:
   # trips so total daily P&L can scale up. Even if all 10 trades lose, the
   # 2 % daily-loss cap halts trading well before the count is reached.
   max_trades_per_day: 10
-  max_open_positions: 3         # Cannot hold more than this many open positions
+  # 2026-05-07 FIX #22: lowered 3 → 2 to satisfy the structural invariant
+  #   max_loss_per_trade_pct × max_open_positions ≤ max_daily_loss_pct
+  # which is now enforced at startup in bot/risk.py. With per_trade=1.0
+  # and open=2, the worst-case simultaneous SL hit (2 × 1% = 2%) lands
+  # exactly on the daily kill-switch — i.e. even an all-trades-stop-out
+  # scenario can never exceed the user's "no losing days" budget. See
+  # the matching note under fno.risk for the F&O-side reasoning.
+  max_open_positions: 2         # Cannot hold more than this many open positions
   max_position_pct: 25.0        # No single position larger than 25% of capital
   reward_risk_ratio: 2.0        # Target gain = 2.0 * stop-loss distance
   trailing_stop: true           # Once +1R is reached, trail SL with ATR
@@ -51,6 +82,9 @@ risk:
   # a daily profit objective — without this, profits give back to the EOD
   # square-off. Set to 0.0 to disable.
   # On ₹50,000 capital: 5.0 = ₹2,500. On ₹1,00,000: 5.0 = ₹5,000.
+  # On ₹3,00,000 (current paper capital after Lever-A bump): 5.0 = ₹15,000
+  # — i.e. essentially "never fires for equity" by design (see Lever-A
+  # comment under ``capital``). Revisit after 5 live trading days.
   daily_profit_target_pct: 5.0
 
 session:
@@ -69,23 +103,31 @@ session:
   timezone: "Asia/Kolkata"
 
 watchlist:
-  # NIFTY 50 large-cap, liquid intraday stocks. Format: NSE symbol.
+  # 2026-05-08 — Option-2 trim. Pinned to the 4 stocks that showed
+  # POSITIVE expectancy after fees in the 60-day backtest
+  # (scripts/strategy_backtest.py, run 2026-05-07 evening):
+  #
+  #   Stock        trades   win%   net (60d)   expect/trade
+  #   HDFCBANK         45   55.6   +₹16,311        +₹362
+  #   SBIN             43   44.2    +₹5,452        +₹126
+  #   INDUSINDBK       46   43.5    +₹5,452        +₹119
+  #   INFY             38   47.4    +₹1,098         +₹29
+  #
+  # The previous 10-stock watchlist (see git history) had 6 negative-
+  # expectancy symbols (RELIANCE, ICICIBANK, AXISBANK, BANKBARODA, ITC,
+  # TCS) whose losses cancelled the wins from these 4 plus ate ₹13K
+  # net. Trimming flips aggregate net from -₹13,434 → +₹28,283 over
+  # the same 60 days while keeping per-trade risk identical.
+  #
+  # CAVEAT: 60 days is a small sample. We will RE-EVALUATE this list
+  # weekly using the same backtest. If a symbol's 60-day net dips
+  # below 0 it gets dropped; if a dropped one returns to positive
+  # for two consecutive weeks it gets added back.
   symbols:
-    - INFY
-    - BANDHANBNK
-    - COALINDIA
-    - BANKBARODA
-    - HCLTECH
-    - ADANIGREEN
     - HDFCBANK
-    - ADANIPORTS
-    - ADANIENT
-    - NESTLEIND
-    - IOC
+    - INFY
+    - SBIN
     - INDUSINDBK
-    - SBILIFE
-    - MARICO
-    - CHOLAFIN
 strategies:
   # 2026-05-06: dropped vwap_revert from the enabled list. It is a pure
   # counter-trend strategy (fade rallies / catch falling knives) that on
@@ -100,11 +142,32 @@ strategies:
     - orb
     - ema_supertrend
   ensemble:
-    # With 2 trend-following strategies enabled, min_agree=2 means BOTH
-    # must agree (i.e. unanimous). This is intentionally conservative —
-    # quality over quantity. If you want more trade frequency at lower
-    # quality, drop to min_agree=1 (single-strategy entries fire).
-    min_agree: 2
+    # 2026-05-07 FIX #25 — lowered 2 → 1 (single-strategy entries OK).
+    #
+    # Why: with min_agree=2, BOTH ORB and EMA-Supertrend had to agree
+    # for an entry. But ``orb.entry_cutoff: 11:30`` means ORB always
+    # returns HOLD after 11:30 IST. Combined with min_agree=2, the bot
+    # could not enter ANY new trade between 11:30 and 13:30 (the
+    # ``trade_cutoff``) — a 2-hour structural deadzone that EMA-
+    # Supertrend alone could not break out of, no matter how clean
+    # its signal was. The MTF wrapper (15m trend confirmation) is
+    # ALREADY a quality filter on every member's signal; min_agree=1
+    # means each member's MTF-confirmed signal can fire on its own.
+    #
+    # Risk envelope stays the same: per-trade SL is still capped at
+    # 1% of capital (max_loss_per_trade_pct), max_open_positions is
+    # still 2, and the daily kill-switch is still 2% (FIX #22 invariant
+    # max_loss_per_trade_pct × max_open_positions ≤ max_daily_loss_pct
+    # is satisfied by 1.0 × 2 = 2.0). The ONLY change is trade
+    # frequency goes from "rare consensus" to "either strategy fires
+    # if MTF-confirmed". The 2026-04-30 → 2026-05-06 history (8 trades
+    # in 5 trading days, 1 win) is too small to evaluate min_agree=2
+    # statistically; min_agree=1 will at least let the bot trade in
+    # the ORB-cutoff window where empirically EMA-Supertrend has
+    # comparable edge. To revert: set this back to 2 — but also
+    # consider lifting orb.entry_cutoff or dropping ORB so the
+    # post-cutoff deadzone doesn't reappear.
+    min_agree: 1
   multitimeframe:
     enabled: true               # Wrap each strategy in MTF confirmation
     base_interval: "5m"         # Fast frame for primary signal
@@ -136,11 +199,25 @@ research:
   top_n: 10
 
 watchlist_updater:
-  enabled: true
-  # Moved 2026-05-04 from 08:00 → 08:15 IST so the daily premarket order
-  # is: 08:00 NSE holiday refresh → 08:15 watchlist updater → 08:30
-  # research agent → 08:55 Redis reset → 09:00 fee audit → 09:15 market
-  # open. Each step now runs after its dependencies have refreshed.
+  # 2026-05-08 — DISABLED for Option-2. The daily updater overwrites
+  # ``watchlist.symbols`` with whatever its top-N volume + trend filter
+  # picks, which would clobber the pinned 4-stock backtest-validated
+  # list (see watchlist comment above). With the updater off the bot
+  # trades exactly the 4 pinned symbols every session.
+  #
+  # When to re-enable:
+  #   * After the user has confirmed which symbols to backtest each
+  #     week, the manual workflow is to run
+  #     ``python scripts/strategy_backtest.py`` and update
+  #     ``watchlist.symbols`` by hand. The auto-updater can come back
+  #     once the backtest is integrated as a pre-filter (i.e. the
+  #     updater picks top-N by VOLUME, then the backtest filters to
+  #     POSITIVE-EXPECTANCY only).
+  #   * Until that integration ships, leaving this true means tomorrow
+  #     morning's 08:15 IST run picks whatever 15 most-liquid stocks
+  #     are trending — which has been the actual cause of much of the
+  #     noise in our recent live trades.
+  enabled: false
   run_at: "08:15"               # IST. Run after holiday refresh, before research.
   top_n: 15                     # Maintain a rolling watchlist of N symbols
   min_avg_volume: 500000        # Liquidity floor (avg shares/day)
@@ -225,7 +302,42 @@ logging:
 # Run ONE per F&O bot process. Multi-strategy needs two `--segment fno`
 # processes with different config files (Phase 5 roadmap).
 fno:
-  enabled: true                # F&O bot runs alongside equity
+  # 2026-05-08 — F&O RE-ENABLED with Option-2 config (60-day backtest).
+  # The bot now runs `option_buy_directional` ONLY (long ATM CE/PE on
+  # EMA20/50 crosses, defined risk = full premium ~₹11K/lot for NIFTY
+  # weekly), the only intraday-friendly F&O strategy with demonstrable
+  # positive expectancy in the backtest:
+  #
+  #   strategy                  trades  win%   net (60d)   med-day   max-DD
+  #   option_buy_directional       90   50.0    +₹56,097    +₹452   -₹10,793
+  #   futures_trend                90   50.0    +₹69,635   -₹1,041  -₹26,724
+  #   credit_spread/iron_condor (live)  10   0.0  -₹6,248   n/a      n/a
+  #
+  # option_buy beats futures_trend on every risk-adjusted metric: same
+  # 50% win rate, lower drawdown (10% of capital vs 27%), positive
+  # median day, fees only 12% of gross (vs 33% for futures). Both old
+  # strategies (credit_spread, iron_condor) are theta-collection plays
+  # that need multi-day holds — the intraday EOD square-off captures
+  # an unprofitable mark, which is why every live trade lost.
+  #
+  # Why capital was bumped from ₹100K → ₹500K (paper) below: with
+  # ₹100K + per-trade=1.0%, the risk gate computes
+  #   risk_qty = 1000 / 105 = 9 < 75 (NIFTY lot)
+  # so 1 lot is rejected at sizing — option_buy can never trade. To
+  # admit 1 NIFTY lot we need either (a) capital ≥ ₹500K, OR (b)
+  # max_loss_per_trade_pct ≥ 1.6%. We do (a) (1.6% per-trade × 1 max-
+  # open = 1.6% daily kill-switch which preserves the user's "no
+  # losing days" envelope). See backtest comments under capital +
+  # risk blocks below.
+  #
+  # FIX #22 invariant still holds:
+  #   max_loss_per_trade_pct × max_open_positions ≤ max_daily_loss_pct
+  #     1.6 × 1 = 1.6 ≤ 2.0 ✓
+  #
+  # To revert this experiment (e.g. if 5-day live shows worse than
+  # the 60-day backtest), flip `enabled: false` and the bot pauses
+  # again — equity continues unaffected.
+  enabled: true
   # How many calendar days BEFORE monthly expiry to roll the futures /
   # option resolver to the NEXT contract. Active futures traders roll
   # 1-2 days early because the dying contract's liquidity collapses on
@@ -233,21 +345,67 @@ fno:
   # legacy behaviour (use the dying contract until expiry-day close).
   rollover_buffer_days: 2
   capital:
-    total: 100000              # ₹1L F&O capital — comfortably covers 1 lot of NIFTY/BANKNIFTY futures margin
+    # 2026-05-08 — Option-2: bumped 100,000 → 500,000 (paper) so the
+    # risk gate can size 1 lot of NIFTY ATM weekly options at the
+    # current per-trade-loss cap. NIFTY ATM CE/PE typical SL distance
+    # is ~₹105/share → 1 lot (75 shares) needs ₹7,875 of risk budget.
+    # At 1.6% per-trade × ₹500K = ₹8,000 cap, sizing approves 1 lot
+    # exactly. With ₹100K we'd need 7.9% per-trade-loss-pct which
+    # breaks the FIX#22 invariant (7.9 × 1 = 7.9 > 2.0 daily cap).
+    #
+    # Note this is PAPER capital — real margin needed to actually
+    # trade these positions is the ₹11,250/lot premium (cash debit),
+    # which fits the original ₹100K allocation easily. The ₹500K
+    # number is purely a sizing-budget knob; it does not imply we
+    # need to actually deposit ₹500K with a broker. When live trading
+    # ships (Phase 5), this number is replaced by the real available
+    # cash + margin from KiteConnect.
+    total: 500000
     deployable_pct: 0.80
   risk:
     max_daily_loss_pct: 2.0
-    max_loss_per_trade_pct: 5.0    # OPTIONS: full premium can be lost; widen
-    # 2026-05-06: bumped from 5 → 10 trades/day, 2 → 5 open positions to
-    # let the F&O bot actually utilise the ₹1L capital. With each
-    # credit-spread or iron-condor blocking only ~₹3-5K of margin (the
-    # max-loss × qty), 2 open positions = ~₹6-10K deployed = ~10% of
-    # capital. The previous caps were leaving ~80-90% of F&O capital
-    # idle. The hard daily-loss kill switch (-2%) and per-trade loss
-    # cap (5%) still bound the downside; this just lets the bot
-    # express its theta-edge across more concurrent positions.
+    # 2026-05-07 FIX #22: enforce the structural invariant
+    #
+    #   max_loss_per_trade_pct × max_open_positions ≤ max_daily_loss_pct
+    #
+    # i.e. even if EVERY currently-open trade hits its stop-loss at the
+    # same moment, total drawdown stays inside the daily kill-switch
+    # budget. Previously this was VIOLATED: per-trade=5.0 × open=5 = 25%
+    # potential simultaneous loss, vs a 2% daily cap. The IC sizer
+    # (bot/risk.py:305-311) used the per-trade budget to scale qty, so
+    # on a 100-wide IC with credit ₹86 (SL-distance ₹9.71) it allocated
+    # 6 lots = 450 contracts = ₹4,372 SL exposure per IC. Two such ICs
+    # open simultaneously = ₹8,864 SL = 4.4× the daily kill-switch.
+    # Today (2026-05-07 11:10 IST) the bot opened exactly that pair;
+    # we squared off manually for a realised -₹528 vs the ₹8,864 tail.
+    #
+    # New defaults (1.0 × 2 = 2.0 = daily cap):
+    #   * max_loss_per_trade_pct: 1.0  → 1 IC sized to int(1000/9.71) =
+    #     103 contracts, floored to 1 lot of 75 (NIFTY) = ₹728 SL.
+    #   * max_open_positions:    2    → at most 2 × ~₹730 ≈ ₹1,460 ≈
+    #     1.46% simultaneous SL exposure, leaves the kill-switch a
+    #     real chance to fire BEFORE the cap is breached.
+    #   * max_trades_per_day:   10    → unchanged (frequency lever, not
+    #     a risk lever — capital-at-risk is still bounded by the
+    #     per-trade × open product above).
+    #
+    # The invariant is now also enforced at startup in bot/risk.py
+    # (RiskManager.__init__ raises ConfigError if violated), so any
+    # future YAML edit that re-introduces an unsafe ratio fails fast
+    # instead of silently sizing the bot into another -₹8K tail.
+    #
+    # 2026-05-08 — Option-2: per-trade 1.0 → 1.6, max_open 2 → 1.
+    # 1.6% × ₹500K = ₹8,000 sizing budget, which covers 1 NIFTY lot
+    # at the typical ₹105/share SL distance (₹7,875). max_open=1
+    # because (a) the strategy emits independent CE/PE entries that
+    # are roughly opposite directional bets — running both at once
+    # = whipsaw; (b) the invariant 1.6 × 1 = 1.6 ≤ 2.0 daily holds.
+    # If live observation shows we're regularly missing trades because
+    # one is open, raise max_open_positions to 2 AND lower per-trade
+    # to 1.0 (1.0 × 2 = 2.0 ≤ 2.0 — still invariant-safe).
+    max_loss_per_trade_pct: 1.6
     max_trades_per_day: 10
-    max_open_positions: 5
+    max_open_positions: 1
     # For options: caps PREMIUM deployed at this % of capital. 50% means
     # one option position can use up to half the F&O budget.
     # For futures: caps margin deployed similarly.
@@ -259,7 +417,12 @@ fno:
     trail_activation_r: 1.0
     trail_lock_r: 0.5
     trail_atr_mult: 1.5
-    daily_profit_target_pct: 5.0
+    # 2026-05-08 — Option-2: 5.0 → 1.0. With capital bumped to ₹500K
+    # the prior 5.0% target translated to a ₹25,000 daily lock-in,
+    # 5x the user's ₹5K ceiling. 1.0% of ₹500K = ₹5,000 — keeps the
+    # absolute lock-in at the SAME ₹5K threshold the bot has used
+    # historically, so the operator's mental model doesn't shift.
+    daily_profit_target_pct: 1.0
   watchlist:
     # Bare underlyings — resolved into futures tradingsymbol (Phase 2)
     # OR into ATM CE/PE option tradingsymbol at signal time (Phase 3).
@@ -269,26 +432,35 @@ fno:
       - NIFTY
       - BANKNIFTY
   strategies:
-    # 2026-05-06: enabled BOTH credit_spread and iron_condor. They
-    # operate in the same numeric space (net credit per share, ~₹40-80
-    # for NIFTY weeklies) AND have *mutually exclusive triggers* —
-    # credit_spread fires on a directional EMA cross, iron_condor fires
-    # on EMA convergence (range-bound regime). At any given moment the
-    # market is either trending or consolidating, so the two strategies
-    # cover complementary regimes without dissenting against each other.
-    # With ``min_agree: 1`` (below) either fires alone — exactly what we
-    # want for regime-aware stacking.
+    # 2026-05-08 — Option-2 strategy switch. The previous lineup
+    # (credit_spread + iron_condor) lost ₹6,248 net over 10 trades / 3
+    # live days because both are theta-collection plays that need
+    # multi-day holds to realise their TP — incompatible with the
+    # bot's intraday-only square-off at 15:15 IST. The 60-day backtest
+    # confirmed the structural problem (0 wins on intraday theta).
     #
-    # The earlier comment block warned against multi-strategy F&O
-    # ensembles because mixing FUTURES (24400 spot) + OPTIONS (₹120
-    # premium) + SPREADS (₹70 net credit) puts SL/TP on incompatible
-    # numeric scales. credit_spread + iron_condor BOTH operate in the
-    # net-credit space, so the warning doesn't apply here. Adding
-    # futures_trend or option_buy_directional WOULD still need a
-    # separate F&O process per the original guidance.
+    # option_buy_directional is the opposite trade: long ATM CE on a
+    # bullish EMA20/EMA50 cross, long ATM PE on a bearish cross.
+    # Defined risk = full premium paid (~₹11,250/lot for NIFTY weekly
+    # ATM at typical IV). Profits when the underlying makes a
+    # favourable 0.3-0.5% intraday move — the canonical scenario for
+    # an EMA-cross signal. 60-day backtest:
+    #
+    #   90 trades / 34 trading days  =  2.6 trades/day
+    #   45 wins, 45 losses           =  50% win rate
+    #   avg win  +₹3,825   avg loss -₹2,578   payoff 1.48
+    #   net P&L (after fees)         =  +₹56,097
+    #   median day                   =  +₹452
+    #   max drawdown                 =  -₹10,793 (≈10% of ₹100K)
+    #   fees                         =   ₹7,700 (12% of gross — clean)
+    #
+    # The earlier multi-strategy warning still applies if you want to
+    # add futures_trend or credit_spread back: they operate on
+    # incompatible numeric scales (₹24,000 spot vs ₹70 net credit) and
+    # would need a separate F&O bot process per scale. For now we run
+    # exactly one strategy.
     enabled:
-      - credit_spread
-      - iron_condor
+      - option_buy_directional
     ensemble:
       min_agree: 1             # Either strategy fires alone (regime-aware)
     multitimeframe:

@@ -119,11 +119,13 @@ To stop Redis later: `brew services stop redis`.
 ```bash
 To use Every Morning at 7:30 AM
 # That's it — one command.
-#python scripts/premarket_preflight.py
-python scripts/premarket_preflight.py --auto-cleanup --clean-redis
+cd ~/Documents/RWork/Demos/Stock-Market-Bot
+source .venv/bin/activate
+python scripts/premarket_preflight.py
+#python scripts/premarket_preflight.py --auto-cleanup --clean-redis
 
 # If exit code is 0 (or 2 with warnings you accept), launch:
-bash scripts/run_bot.sh run --paper
+bash scripts/run_bot.sh run --paper --segment equity
 bash scripts/run_bot.sh run --paper --segment fno
 python -m cli dashboard
 
