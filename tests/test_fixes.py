@@ -449,12 +449,24 @@ def main() -> int:
     from bot.fees import compute_fees, roundtrip_breakdown
     eq_fee = compute_fees("BUY", 75, 24000.0, segment="equity")
     fut_fee = compute_fees("BUY", 75, 24000.0, segment="futures")
-    # Futures STT (sell side) is 0.0125% vs equity 0.025% — half the rate.
+    # FIX #21r (2026-05-13): Reverted FIX #21. Live audit against zerodha,
+    # upstox and dhan confirms the regulator-set rates currently in force:
+    #   equity intraday STT sell : 0.025%
+    #   futures STT sell         : 0.05%   (2× equity intraday)
+    #   options STT sell premium : 0.15%   (6× equity intraday)
+    # FIX #21 had reduced these to 0.0125% / 0.0625% on the strength of an
+    # internal "regression suite" with hardcoded values (not an external
+    # source). The fee_audit subsystem (added 2026-05-04) caught the drift
+    # against THREE independent SEBI-regulated broker mirrors. Pin the
+    # live ordering here so future drift is again caught by both the audit
+    # and the regression test.
     eq_sell  = compute_fees("SELL", 75, 24100.0, segment="equity")
     fut_sell = compute_fees("SELL", 75, 24100.0, segment="futures")
-    assert fut_sell.stt < eq_sell.stt, \
-        f"futures STT {fut_sell.stt} should be < equity STT {eq_sell.stt}"
-    # Futures exchange is 0.00188% vs equity 0.00345% — also lower.
+    assert fut_sell.stt > eq_sell.stt, \
+        f"futures STT {fut_sell.stt} should be > equity intraday STT {eq_sell.stt} (live rates: 0.05% > 0.025%)"
+    # Futures exchange charge is still LOWER than equity exchange charge
+    # (futures NSE 0.00183% vs equity NSE 0.00307%) — that part of FIX #21
+    # was not touched by the reversal.
     assert fut_fee.exchange < eq_fee.exchange, \
         f"futures exchange {fut_fee.exchange} should be < equity {eq_fee.exchange}"
     rt = roundtrip_breakdown(75, 24000.0, 24100.0, "long", segment="futures")
@@ -613,17 +625,23 @@ def main() -> int:
         return 1
     print(f"  ✓ ATM strike rounding: NIFTY→50-step, BANKNIFTY→100-step")
 
-    # 8d. Option fee schedule: STT on premium SELL is much higher than equity.
+    # 8d. Option fee schedule: STT on premium SELL is much higher than both
+    # equity intraday and futures.
     from bot.fees import compute_fees as _cf
     eq_sell  = _cf("SELL", 75, 200.0, segment="equity")
     opt_sell = _cf("SELL", 75, 200.0, segment="options")
     fut_sell = _cf("SELL", 75, 200.0, segment="futures")
-    # Options STT (0.0625% on premium) > equity STT (0.025%) > futures STT (0.0125%)
-    if not (opt_sell.stt > eq_sell.stt > fut_sell.stt):
-        print(f"  ✗ FAILED — STT ordering wrong: opt={opt_sell.stt} eq={eq_sell.stt} fut={fut_sell.stt}")
+    # FIX #21r (2026-05-13): Live regulator rates per zerodha/upstox/dhan:
+    #   options STT premium-sell : 0.15%
+    #   futures STT sell         : 0.05%
+    #   equity intraday STT sell : 0.025%
+    # Ordering: options > futures > equity intraday (NOT options > equity > futures
+    # as FIX #21 had it — the FIX-#21 ordering only held under the wrong rates).
+    if not (opt_sell.stt > fut_sell.stt > eq_sell.stt):
+        print(f"  ✗ FAILED — STT ordering wrong: opt={opt_sell.stt} fut={fut_sell.stt} eq={eq_sell.stt}")
         return 1
     print(f"  ✓ Option fee schedule: STT(opt)=₹{opt_sell.stt:.2f} > "
-          f"STT(eq)=₹{eq_sell.stt:.2f} > STT(fut)=₹{fut_sell.stt:.2f}")
+          f"STT(fut)=₹{fut_sell.stt:.2f} > STT(eq)=₹{eq_sell.stt:.2f}")
 
     # 8e. Strategy fires BUY for ATM CE on synthetic bullish data
     # (same data construction as Fix #7).

@@ -69,12 +69,23 @@ _RATES: Dict[str, float] = {
 
 # ─── Rate table — index FUTURES (NSE F&O) ────────────────────────────────────
 #
-# Verified against Zerodha brokerage calculator (April 2026). Stamp duty is
-# state-specific (Maharashtra 0.002%); other states the rate may differ but
-# the impact on a per-trade basis is sub-rupee.
+# Verified against Zerodha brokerage calculator (April 2026) and re-verified
+# 2026-05-13 via the multi-source ``bot.fee_audit`` against zerodha.com,
+# upstox.com and dhan.co. Stamp duty is state-specific (Maharashtra 0.002%);
+# other states differ but the impact on a per-trade basis is sub-rupee.
+#
+# DO NOT lower ``stt_sell_pct`` below 0.0005 (= 0.05%) without re-running
+# ``python -m cli verify-fees`` against the live source pages first.
+# History: an earlier "FIX #21" (commit f062ab2, 2026-05-06) reduced this
+# to 0.000125 (0.0125%) on the strength of an internal regression test
+# whose ground-truth was hardcoded, not externally-sourced. The fee_audit
+# subsystem caught the resulting drift across ALL THREE source pages on
+# 2026-05-13 and the change was reverted ("FIX #21r"). Net effect of the
+# bad week: ~₹3.4K/day of phantom under-payment of STT on the F&O side
+# of paper P&L. Don't repeat — when in doubt, the audit is the truth.
 _FUTURES_RATES: Dict[str, float] = {
     "brokerage_flat":        20.0,        # ₹20 flat per order — NO percentage cap
-    "stt_sell_pct":          0.000125,    # 0.0125% on sell-side contract value
+    "stt_sell_pct":          0.0005,    # 0.05% on sell-side contract value
     "exchange_pct":          0.0000183,   # NSE F&O: 0.00183% per leg
     "sebi_per_crore":        10.0,        # Same as equity
     "stamp_buy_pct":         0.00002,     # 0.002% on buy-side contract value
@@ -95,9 +106,14 @@ _FUTURES_RATES: Dict[str, float] = {
 #
 # STT on option SELLING is the steepest of any segment in this table.
 # Buyers pay zero STT (it's reflected in the rate being sell-only).
+#
+# DO NOT lower ``stt_sell_pct`` below 0.0015 (= 0.15%) without re-running
+# ``python -m cli verify-fees`` first. See the history note on
+# ``_FUTURES_RATES`` above for the FIX #21 / FIX #21r episode (the same
+# regression touched both rates).
 _OPTIONS_RATES: Dict[str, float] = {
     "brokerage_flat":        20.0,        # ₹20 flat per order — NO percentage cap
-    "stt_sell_pct":          0.000625,    # 0.0625% on PREMIUM-sell side ONLY
+    "stt_sell_pct":          0.0015,    # 0.15% on PREMIUM-sell side ONLY
     "exchange_pct":          0.0003553,    # NSE options: 0.03553% on premium per leg
     "sebi_per_crore":        10.0,        # ₹10 per crore of premium turnover
     "stamp_buy_pct":         0.00003,     # 0.003% on premium-buy side ONLY
