@@ -380,6 +380,131 @@ def daily_summary(day: Optional[date] = None,
 
 
 # ============================================================================
+# Multi-day P&L history (dashboard 30-day view)
+# ============================================================================
+
+def _journal_dates(segment: Segment) -> List[date]:
+    """Return all dates that have a trade journal on disk for ``segment``.
+
+    Looks at ``logs/trades/<seg>/YYYY-MM-DD.jsonl`` (the authoritative
+    source — the .csv twin is a convenience export). Sorted ascending.
+    """
+    base = _logs_root(segment) / "trades" / journal_subdir(segment)
+    if not base.exists():
+        return []
+    out: List[date] = []
+    for p in base.glob("*.jsonl"):
+        try:
+            out.append(date.fromisoformat(p.stem))
+        except ValueError:
+            continue   # ignore stray files like "2026-04-30.jsonl.corrupted-..."
+    out.sort()
+    return out
+
+
+def pnl_history(lookback_days: int = 30,
+                segment: Optional[Segment] = None,
+                *, end_day: Optional[date] = None) -> List[Dict[str, Any]]:
+    """Return a per-day P&L summary for the last ``lookback_days``
+    *trading* days (i.e. days that actually have a journal on disk —
+    weekends/holidays are skipped automatically).
+
+    If ``segment`` is None, BOTH segments are aggregated and the union
+    of date sets is returned, with combined ``net_pnl``, ``trades``,
+    ``wins`` etc. If ``segment`` is provided, only that segment is
+    summarised.
+
+    Each row carries:
+        date, segment, net_pnl, gross_pnl, fees, trades, wins, losses,
+        win_rate, return_pct, expectancy, profit_factor
+
+    When ``segment`` is None, ``return_pct`` is computed against the
+    SUM of both segments' configured capital (so the combined-day-%
+    is comparable to the per-segment %).
+
+    Used by the dashboard's 30-day strip on the Overview tab and the
+    full History tab (postmortem of 2026-05-15 made this visibility
+    a hard requirement — a single -₹31K day that the operator only
+    notices after-the-fact is ungovernable).
+    """
+    end_day = end_day or date.today()
+
+    if segment is not None:
+        seg_dates = [d for d in _journal_dates(segment) if d <= end_day]
+        seg_dates = seg_dates[-lookback_days:] if lookback_days > 0 else seg_dates
+        return [_summary_row(d, segment) for d in seg_dates]
+
+    # Both segments — union the date sets and combine per-day.
+    all_dates: set[date] = set()
+    for seg in (Segment.EQUITY, Segment.FNO):
+        for d in _journal_dates(seg):
+            if d <= end_day:
+                all_dates.add(d)
+    sorted_dates = sorted(all_dates)
+    if lookback_days > 0:
+        sorted_dates = sorted_dates[-lookback_days:]
+
+    cfg = load_config()
+    cap_combined = (cfg_capital(cfg, Segment.EQUITY).total
+                    + cfg_capital(cfg, Segment.FNO).total)
+
+    rows: List[Dict[str, Any]] = []
+    for d in sorted_dates:
+        eq = _summary_row(d, Segment.EQUITY)
+        fn = _summary_row(d, Segment.FNO)
+        net = eq["net_pnl"] + fn["net_pnl"]
+        rows.append({
+            "date": d.isoformat(),
+            "segment": "combined",
+            "trades": eq["trades"] + fn["trades"],
+            "wins": eq["wins"] + fn["wins"],
+            "losses": eq["losses"] + fn["losses"],
+            "win_rate": ((eq["wins"] + fn["wins"]) /
+                         max(eq["trades"] + fn["trades"], 1)),
+            "gross_pnl": round(eq["gross_pnl"] + fn["gross_pnl"], 2),
+            "fees": round(eq["fees"] + fn["fees"], 2),
+            "net_pnl": round(net, 2),
+            "return_pct": round(net / cap_combined * 100, 3) if cap_combined else 0.0,
+            "equity_net_pnl": eq["net_pnl"],
+            "fno_net_pnl": fn["net_pnl"],
+            "equity_trades": eq["trades"],
+            "fno_trades": fn["trades"],
+        })
+    return rows
+
+
+def _summary_row(day: date, segment: Segment) -> Dict[str, Any]:
+    """Compact per-day summary used by ``pnl_history``. Always returns
+    a row even if no trades that day (zeros + 'no-trade' sentinel)."""
+    s = daily_summary(day, segment=segment)
+    if s.get("trades", 0) == 0:
+        return {
+            "date": day.isoformat(),
+            "segment": segment.value,
+            "trades": 0, "wins": 0, "losses": 0,
+            "win_rate": 0.0,
+            "gross_pnl": 0.0, "fees": 0.0, "net_pnl": 0.0,
+            "return_pct": 0.0,
+            "expectancy": 0.0,
+            "profit_factor": 0.0,
+        }
+    return {
+        "date": s["date"],
+        "segment": s["segment"],
+        "trades": s["trades"],
+        "wins": s["wins"],
+        "losses": s["losses"],
+        "win_rate": s["win_rate"],
+        "gross_pnl": s["gross_pnl"],
+        "fees": s["fees"],
+        "net_pnl": s["net_pnl"],
+        "return_pct": s["return_pct"],
+        "expectancy": s["expectancy"],
+        "profit_factor": s["profit_factor"] if s["profit_factor"] != "inf" else 0.0,
+    }
+
+
+# ============================================================================
 # EOD report writer (pretty text)
 # ============================================================================
 

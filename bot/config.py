@@ -23,6 +23,14 @@ class EnvSettings(BaseSettings):
     LIVE_TRADING: bool = False
     BROKER: str = "paper"
 
+    # FIX #36 (2026-05-16) — Pluggable market-data source.
+    # Selects which backend serves bot.data.intraday_bars and history:
+    #   yfinance  (default — legacy free Yahoo scrape)
+    #   dhan      (free with Dhan trading account, no daily login)
+    #   auto      (try dhan first, fall back to yfinance)
+    # Empty / unset = yfinance (preserves pre-Phase-5 behaviour).
+    DATA_SOURCE: str = ""
+
     KITE_API_KEY: Optional[str] = None
     KITE_API_SECRET: Optional[str] = None
     KITE_ACCESS_TOKEN: Optional[str] = None
@@ -86,6 +94,35 @@ class RiskCfg(BaseModel):
     trail_activation_r: float = 1.0
     trail_lock_r: float = 0.5
     trail_atr_mult: float = 1.0
+
+    # FIX #37 (2026-05-16) — Fee-aware entry gate.
+    #
+    # Refuses any trade whose expected round-trip fees (entry + exit at
+    # take-profit) exceed this percentage of the expected gross profit.
+    # Uses bot.fees.roundtrip_breakdown to compute realistic fees for
+    # the actual segment (equity / futures / options) — so the gate
+    # respects the FIX #21r STT rates, the flat ₹20 brokerage, GST,
+    # exchange/SEBI/stamp charges.
+    #
+    # Why this matters: option-buy strategies in particular can fire
+    # signals where the SL/TP envelope is tight relative to the premium,
+    # producing an expected gross of ₹500-1500 against ~₹100-150 of
+    # round-trip fees on a single NIFTY lot. That's 10-30% drag —
+    # absorbing a string of breakeven trades grinds capital down even
+    # when "win-rate" looks fine.
+    #
+    # 25% threshold rationale: a strategy with 50% win-rate and 1.5
+    # reward/risk needs gross-fee-drag below ~30% to clear
+    # the breakeven (calculated against 60-day backtest distributions).
+    # 25% leaves a small safety margin while letting through the bulk
+    # of historical trades. Adjust UP to be more permissive,
+    # DOWN to be stricter. Set to 0 / 100+ to disable the gate.
+    #
+    # Spreads and iron-condors are EXEMPT (defined-risk credit
+    # strategies have a different P&L mechanic — gross is the credit
+    # collected, not the TP/SL distance — and the fee gate's TP-based
+    # gross calculation doesn't apply directly).
+    max_fee_pct_of_gross: float = 25.0
 
 
 class SessionCfg(BaseModel):
@@ -262,10 +299,117 @@ class OptionBuyDirectionalCfg(BaseModel):
     # tweaking (e.g. set higher iv on volatile expiry day).
     iv: float = 0.15                   # Annualised volatility, decimal
     risk_free_rate: float = 0.07       # Annualised, decimal
-    # Floor the SL premium at this fraction of the entry premium so a
-    # single fast spike against us doesn't take 90%+ of premium before
-    # the trail can engage. 0.30 = max 70% premium loss per trade.
-    min_sl_premium_pct: float = 0.30
+    # Floor the SL premium at this fraction of the entry premium —
+    # caps the maximum allowed premium drop before SL fires.
+    #
+    # FIX #31 (2026-05-15): raised 0.30 → 0.65 in response to the
+    # BANKNIFTY26MAY54200CE -₹22,711 disaster. The old 0.30 floor
+    # allowed up to 70% premium loss per trade, well above the 1.6%
+    # per-trade-loss cap when scaled by lot size. With 0.65 floor the
+    # worst-case premium drop is 35%, which on a ₹62K capital-at-risk
+    # trade caps loss at ~₹22K — still hefty, but bounded. Combined
+    # with FIX #29 (positions are now managed all the way to
+    # square_off so SL actually triggers) and FIX #30 (daily kill
+    # switch force-closes the book at -2% daily P&L), the realistic
+    # worst single-trade loss is the per-trade-loss cap (~₹8K on
+    # ₹500K F&O capital).
+    #
+    # If the BS-derived SL is already tighter (smaller drop) than this
+    # floor, the BS value is used — the floor only applies as a
+    # CAP on how loose the SL can be.
+    min_sl_premium_pct: float = 0.65
+
+    # FIX #32 (2026-05-15) — Volatility-regime filter ("theta-trap"
+    # avoidance).
+    #
+    # Long-option buyers need a TRENDING underlying to overcome theta.
+    # If realised vol is low (chop / range-bound regime), theta wins
+    # even if the EMA cross fires. Today's BANKNIFTY 13:11 entry was
+    # exactly this scenario — realised 1h vol was 9.32% (annualised),
+    # the lowest of any signal event in the journal. Spot then chopped
+    # within a 1.1% range and theta + adverse delta cratered the
+    # premium 36% by EOD square-off (₹698 → ₹448 = -₹22,711.61 net).
+    #
+    # Empirical calibration (signal-fire-moment realised vol over 1h):
+    #
+    #   2026-05-15 13:11  BANKNIFTY  9.32-10.77% →  -₹22,711  (CATASTROPHE)
+    #   2026-05-15 11:26  BANKNIFTY 14.07%       →   -₹7,431  (loss bounded by SL)
+    #   2026-05-14 12:09  NIFTY     14.11%       →   +₹3,061  (TP)
+    #   2026-05-14 09:43  NIFTY     25.28%       →   +₹9,208  (TP)
+    #   2026-05-14 09:30  NIFTY     26.22%       →   -₹5,602  (SL)
+    #   2026-05-08 09:41  NIFTY     22.51%       →   +₹5,266  (lockin)
+    #
+    # 12% floor cleanly skips the catastrophic 13:11 entry (well below
+    # threshold) while preserving every TP winner above 14%. A 10%
+    # floor was tested first but the realised-vol estimate fluctuates
+    # ~±1% across yfinance fetches, so 12% gives proper safety margin.
+    #
+    # Set to 0.0 to disable the filter (returns to pre-FIX-#32 behaviour).
+    min_realized_vol_pct: float = 0.12
+    realized_vol_lookback_bars: int = 12      # 12 × 5m = 1h of bars
+
+    # FIX #33 (2026-05-15) — RSI extreme filter ("buying-the-top" guard).
+    #
+    # Long-option entries on a momentum cross are vulnerable to
+    # mean-reversion when the underlying has already had a strong
+    # run-up. Today's 13:11 BANKNIFTY entry: RSI(14) on 5m = 67.8 —
+    # well into "near-overbought" territory after a 200-pt rally
+    # over the prior hour. The EMA20/50 cross was a LATE momentum
+    # signal that fired right at the local top; spot then reverted
+    # 500+ points over the next 2h.
+    #
+    # Filter: refuse a long CE entry when RSI > ``rsi_overbought``
+    # (default 65) and a long PE entry when RSI < ``rsi_oversold``
+    # (default 35). This is the canonical institutional
+    # mean-reversion safeguard — used by every desk that does
+    # systematic options buying.
+    #
+    # Set both to 0/100 to disable.
+    rsi_period: int = 14
+    rsi_overbought: float = 65.0    # Block CE buys when RSI ≥ this
+    rsi_oversold: float = 35.0      # Block PE buys when RSI ≤ this
+
+    # FIX #34 (2026-05-15) — Bollinger %B mean-reversion filter.
+    #
+    # %B = (price - lower_band) / (upper_band - lower_band). Values
+    # near 1.0 mean price is hugging the upper Bollinger Band — i.e.,
+    # ~2σ above the 20-period MA. Buying calls at the upper band is
+    # a classic "fading the obvious" mistake; the band is a
+    # statistical resistance that mean-reverters short.
+    #
+    # Today's 13:11 BANKNIFTY entry: %B = 90% (close ₹54,246 vs upper
+    # ₹54,283, lower ₹53,909). Strong BLOCK signal under any
+    # reasonable threshold.
+    #
+    # Filter: refuse CE buy when %B > ``bb_upper_threshold`` (default
+    # 0.85), refuse PE buy when %B < ``bb_lower_threshold`` (default
+    # 0.15). Combined with the RSI filter above, we have two
+    # independent mean-reversion guards that AGREE on today's entry.
+    #
+    # Set to 1.0/0.0 to disable.
+    bb_period: int = 20
+    bb_std: float = 2.0
+    bb_upper_threshold: float = 0.85   # Block CE buys when %B ≥ this
+    bb_lower_threshold: float = 0.15   # Block PE buys when %B ≤ this
+
+    # FIX #35 (2026-05-15) — Multi-source price validation.
+    #
+    # Before placing a trade we cross-check the yfinance spot used
+    # by the strategy against NSE's free public REST endpoint. If
+    # the two sources disagree by more than this percentage we
+    # refuse the trade — symptom of a yfinance bad-tick / stale
+    # cache / aggregator glitch.
+    #
+    # Threshold rationale: NSE pricing is the authoritative source.
+    # Normal scrape lag between NSE and yfinance is <0.05% (a few
+    # basis points on indices). 1.0% gives huge safety margin
+    # against false positives while still catching the rare
+    # multi-percent divergence that signals a real data problem.
+    #
+    # Set to 0.0 to disable. The check is fail-open: when NSE is
+    # unreachable (network blip, rate-limit) the trade proceeds
+    # on yfinance alone.
+    multisource_max_divergence_pct: float = 1.0
 
 
 class EnsembleCfg(BaseModel):
@@ -379,6 +523,25 @@ class FnoCfg(BaseModel):
     rollover_buffer_days: int = 2
 
 
+class MarketDataCfg(BaseModel):
+    """FIX #36 — Pluggable market-data source selection.
+
+    The selected ``source`` decides which backend serves
+    :func:`bot.data.intraday_bars` and :func:`bot.data.history`:
+
+      * ``yfinance`` — free Yahoo scrape (default; preserves
+        pre-Phase-5 behaviour).
+      * ``dhan``     — Dhan REST + WebSocket (free with a Dhan
+        trading account, no daily login). Falls back to yfinance
+        when credentials are missing or the upstream is down.
+      * ``auto``     — try Dhan first, fall back to yfinance.
+
+    Env var ``DATA_SOURCE`` overrides this YAML setting when set.
+    """
+    source:   str = "yfinance"
+    fallback: str = "yfinance"
+
+
 class AppConfig(BaseModel):
     capital: CapitalCfg = CapitalCfg()
     risk: RiskCfg = RiskCfg()
@@ -391,6 +554,7 @@ class AppConfig(BaseModel):
     feed: FeedCfg = FeedCfg()
     backtest: BacktestCfg = BacktestCfg()
     logging: LoggingCfg = LoggingCfg()
+    market_data: MarketDataCfg = MarketDataCfg()
     # Optional F&O segment block. ``None`` means "F&O is disabled" — the
     # equity behaviour above is fully backward-compatible without it.
     fno: Optional[FnoCfg] = None

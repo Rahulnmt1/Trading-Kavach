@@ -139,6 +139,69 @@ def _interval_to_timedelta(interval: str) -> Optional[timedelta]:
     return None
 
 
+def _maybe_route_to_alternate_source(method_name: str, *args, **kwargs):
+    """FIX #36 — Pluggable data-source routing.
+
+    When ``DATA_SOURCE`` env var (or ``config.yaml::market_data.source``)
+    points at a non-yfinance backend (e.g. ``dhan``), route the call
+    there. Returns the alternate-source result, or ``None`` if the
+    registry is configured for yfinance (in which case the caller
+    falls through to the legacy yfinance code path below).
+
+    The registry's :class:`FallbackDataSource` already handles the
+    "primary failed → try fallback" case internally, so by the time
+    we get a non-empty DataFrame back here we know it's authoritative.
+
+    We also gate this with a sentinel ``_in_alternate_route`` thread-
+    local flag so the alternate source's own delegation back to
+    ``bot.data`` (e.g. for synthetic option bars) doesn't re-enter
+    this routing logic and infinite-loop.
+    """
+    state = _alt_route_state
+    if getattr(state, "active", False):
+        return None
+    try:
+        from .data_sources.registry import get_data_source
+        from .data_sources.yfinance_source import YFinanceDataSource
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        src = get_data_source()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("get_data_source failed: {} — using legacy yfinance path", exc)
+        return None
+    # If the active source is yfinance (either directly or as the head
+    # of a fallback chain that starts with yfinance), skip routing —
+    # the legacy code path handles yfinance natively and has all the
+    # FIX #20/#27 logic baked in.
+    if isinstance(src, YFinanceDataSource):
+        return None
+    # FallbackDataSource exposes the chain as ``_sources``; if the
+    # primary IS yfinance we also skip (the chain's other sources are
+    # only reached when yfinance fails, which the legacy retry loop
+    # handles already).
+    chain = getattr(src, "_sources", None)
+    if chain and chain[0].__class__.__name__ == "YFinanceDataSource":
+        return None
+    state.active = True
+    try:
+        method = getattr(src, method_name, None)
+        if method is None:
+            return None
+        return method(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[data_sources] {} failed for {}: {} — falling back to yfinance",
+                       src.name, method_name, exc)
+        return None
+    finally:
+        state.active = False
+
+
+# Thread-local re-entry guard for the routing helper above.
+import threading as _threading  # noqa: E402
+_alt_route_state = _threading.local()
+
+
 def history(symbol: str, days: int = 5, interval: str = "1m") -> pd.DataFrame:
     """Fetch OHLCV. yfinance limits intraday lookback (~7 days for 1m).
 
@@ -149,7 +212,18 @@ def history(symbol: str, days: int = 5, interval: str = "1m") -> pd.DataFrame:
     Mondays after weekends — see the module-level FIX #27 note. A fresh
     ``yf.Ticker`` is created per attempt to bypass any internal
     "no-data" caching inside yfinance.
+
+    FIX #36: when an alternate data source is configured (Dhan, etc.)
+    via ``DATA_SOURCE`` env var, route through it first; on failure
+    the FallbackDataSource chain catches the empty result and we
+    drop through to the yfinance code path below.
     """
+    routed = _maybe_route_to_alternate_source(
+        "history", symbol, days=days, interval=interval,
+    )
+    if routed is not None and not routed.empty:
+        return routed
+
     ticker_str = to_yf(symbol)
     period = f"{days}d"
     df = pd.DataFrame()
@@ -296,6 +370,13 @@ def intraday_bars(symbol: str, interval: str = "5m") -> pd.DataFrame:
     NET premium across all four legs (short put + long put + short
     call + long call), with the OHLC range computed at the spot
     extremes of each bar.
+
+    FIX #36 (Phase 5A): if a non-yfinance data source is configured,
+    spot/futures bars come from that source (Dhan REST today; KiteTicker
+    or Dhan WebSocket in Phase 5B). Synthetic option/spread/IC bars
+    keep flowing through the BS pipeline below — when the alternate
+    source's own intraday_bars sees an option tradingsymbol it routes
+    back to legacy via the re-entry guard.
     """
     from .instruments.fno import (
         parse_iron_condor_tradingsymbol,
@@ -311,6 +392,13 @@ def intraday_bars(symbol: str, interval: str = "5m") -> pd.DataFrame:
     parsed = parse_option_tradingsymbol(symbol)
     if parsed is not None:
         return _synth_option_bars(parsed, interval)
+
+    # FIX #36: route to alternate source if configured and available.
+    routed = _maybe_route_to_alternate_source(
+        "intraday_bars", symbol, interval=interval,
+    )
+    if routed is not None and not routed.empty:
+        return routed
 
     is_fno = yfinance_proxy(symbol) is not None
 

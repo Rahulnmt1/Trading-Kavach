@@ -17,6 +17,7 @@ from typing import Optional
 from .broker.base import Broker, InstrumentKind
 from .cache import get_cache
 from .config import PROJECT_ROOT, load_config
+from .fees import roundtrip_breakdown as _fee_roundtrip
 from .logger import logger
 from .segment import Segment, cache_key, cfg_capital, cfg_risk
 from .strategies.base import Signal, SignalType
@@ -343,6 +344,102 @@ class RiskManager:
     def _kill_switch_active(self) -> bool:
         return KILL_SWITCH.exists()
 
+    # ── FIX #37 (2026-05-16) — Fee-aware entry gate ───────────────────────
+    def _check_fee_edge(
+        self,
+        signal: Signal,
+        qty: int,
+        fee_segment: str,
+    ) -> Optional[str]:
+        """Reject a sized trade if expected round-trip fees consume too
+        much of the expected gross profit at take-profit.
+
+        Returns the rejection reason (string) if the gate fires, or
+        ``None`` if the trade clears the gate.
+
+        Inputs
+        ------
+        ``signal`` is a sized BUY/SELL signal with ``price``, ``stop_loss``,
+        ``take_profit`` set. ``qty`` is the quantity the sizer just
+        approved. ``fee_segment`` is the value passed to
+        :func:`bot.fees.roundtrip_breakdown` — one of ``"equity"`` /
+        ``"futures"`` / ``"options"``.
+
+        Math
+        ----
+        ``gross = (TP − entry) × qty`` for a long trade,
+        ``gross = (entry − TP) × qty`` for a short.
+        ``fees = roundtrip_breakdown(qty, entry, TP, direction, segment).fees_total``
+        — i.e. realistic post-FIX-#21r STT + flat ₹20 brokerage + GST +
+        exchange + SEBI + stamp.
+
+        The gate fires when ``fees / gross × 100 > max_fee_pct_of_gross``.
+
+        Why TP-based gross
+        ------------------
+        Using TP gives the BEST-CASE gross — i.e. the gate is permissive,
+        rejecting only trades whose fee drag is unmanageable even in the
+        winning scenario. If TP isn't set (rare; some squareoff signals
+        skip TP), the gate is silently bypassed.
+
+        Disabled when
+        -------------
+        * ``max_fee_pct_of_gross`` is ≤ 0 or ≥ 100 (full disable);
+        * ``signal.take_profit`` is None or non-positive;
+        * gross profit is non-positive (degenerate / invalid TP).
+        """
+        threshold = float(getattr(self._risk_cfg, "max_fee_pct_of_gross", 0.0) or 0.0)
+        if threshold <= 0.0 or threshold >= 100.0:
+            return None
+        tp = signal.take_profit
+        if tp is None or tp <= 0.0 or signal.price <= 0.0 or qty <= 0:
+            return None
+
+        # BUY signal → long; SELL → short. Same convention as Signal.type.
+        direction = "long" if signal.type == SignalType.BUY else "short"
+        if direction == "long":
+            gross_per_share = tp - signal.price
+        else:
+            gross_per_share = signal.price - tp
+        if gross_per_share <= 0.0:
+            # Degenerate — TP is on the wrong side of entry. Defensive: let
+            # the rest of the pipeline reject (this should already have
+            # been caught upstream).
+            return None
+
+        try:
+            rt = _fee_roundtrip(
+                qty=int(qty),
+                entry_price=float(signal.price),
+                exit_price=float(tp),
+                direction=direction,
+                segment=fee_segment,  # type: ignore[arg-type]
+            )
+        except Exception as e:  # noqa: BLE001
+            # Fee module raises ValueError on direction typos etc. Defensive
+            # — shouldn't happen given the call sites, but fail-open so the
+            # gate never blocks a trade due to its own bug.
+            logger.warning(
+                "[risk:{}] _check_fee_edge: roundtrip_breakdown failed "
+                "({}); fee gate skipped for {}", self.segment.value, e,
+                signal.symbol,
+            )
+            return None
+
+        gross = rt.gross_pnl
+        if gross <= 0:
+            return None
+        fee_pct = rt.fees_total / gross * 100.0
+        if fee_pct > threshold:
+            return (
+                f"FIX #37 fee-edge: expected round-trip fees "
+                f"₹{rt.fees_total:,.0f} = {fee_pct:.1f}% of "
+                f"₹{gross:,.0f} TP-gross > {threshold:.0f}% threshold "
+                f"(qty={qty}, entry=₹{signal.price:.2f}, "
+                f"TP=₹{tp:.2f}, segment={fee_segment})"
+            )
+        return None
+
     def evaluate(self, signal: Signal) -> RiskDecision:
         self._reset_if_new_day()
 
@@ -543,6 +640,10 @@ class RiskManager:
                         f"₹{cash:,.0f}. Either raise fno.capital.total OR widen "
                         f"max_loss_per_trade_pct OR pick a deeper-OTM strike.",
                     )
+                # FIX #37 (2026-05-16) — fee-aware gate (options).
+                fee_reject = self._check_fee_edge(signal, qty, "options")
+                if fee_reject:
+                    return RiskDecision(False, 0, fee_reject)
                 lots = qty // lot
                 return RiskDecision(
                     True, qty,
@@ -570,6 +671,10 @@ class RiskManager:
                     f"({m_pct*100:.0f}% of ₹{signal.price * lot:,.0f} contract value); "
                     f"available cash ₹{cash:,.0f}.",
                 )
+            # FIX #37 (2026-05-16) — fee-aware gate (futures).
+            fee_reject = self._check_fee_edge(signal, qty, "futures")
+            if fee_reject:
+                return RiskDecision(False, 0, fee_reject)
             lots = qty // lot
             return RiskDecision(
                 True, qty,
@@ -589,6 +694,11 @@ class RiskManager:
                 f"qty=0 (risk_qty={risk_qty}, size_cap={size_cap}, cash_cap={cash_cap})",
             )
 
+        # FIX #37 (2026-05-16) — fee-aware gate (equity).
+        fee_reject = self._check_fee_edge(signal, qty, "equity")
+        if fee_reject:
+            return RiskDecision(False, 0, fee_reject)
+
         return RiskDecision(True, qty, f"approved qty={qty} (risk=₹{max_loss:.0f}, sl={risk_per_share:.2f}/sh)")
 
     def record_trade(self) -> None:
@@ -600,7 +710,55 @@ class RiskManager:
         return now_time >= self.cfg.session.t("square_off")
 
     def in_trading_window(self, now_time) -> bool:
+        """Window during which NEW entries are allowed.
+
+        Note: this is NOT the position-management window — see
+        :meth:`in_management_window` for that. Confusing the two caused
+        FIX #29 (trade_cutoff returning early in ``Executor.tick`` left
+        open positions unmanaged for 1h 45m on 2026-05-15, which rode
+        BANKNIFTY26MAY54200CE from a recoverable -₹6.7K SL fill all the
+        way to a -₹22.7K EOD square-off).
+        """
         return self.cfg.session.t("trade_start") <= now_time <= self.cfg.session.t("trade_cutoff")
+
+    def in_management_window(self, now_time) -> bool:
+        """Window during which open positions MUST be managed (SL/TP/trail).
+
+        Wider than :meth:`in_trading_window`: starts at ``trade_start``
+        (no point managing before market is open) and runs until
+        ``square_off`` (after which ``_end_of_day`` does the forced
+        close). The gap between ``trade_cutoff`` and ``square_off`` —
+        currently 13:30→15:15 IST = 1h 45m — is precisely the window
+        where today's catastrophic BANKNIFTY trade rode unmanaged.
+
+        FIX #29: ``Executor.tick`` now uses this method (not
+        ``in_trading_window``) to decide whether to call
+        ``_manage_open_positions``.
+        """
+        return self.cfg.session.t("trade_start") <= now_time < self.cfg.session.t("square_off")
+
+    def daily_loss_kill_breached(self) -> bool:
+        """FIX #30 — Open-position kill switch.
+
+        Returns True when today's combined realized + unrealized P&L has
+        breached the configured ``max_daily_loss_pct`` threshold. The
+        existing :meth:`evaluate` gate uses the same threshold to BLOCK
+        new entries; this method exists so the executor can force-close
+        ALREADY-OPEN positions when one of them blows past its per-trade
+        SL faster than the manager can react (theta + adverse spot move
+        on a long option premium is the canonical case — today's
+        BANKNIFTY26MAY54200CE breached -2% combined while the bot was
+        still holding it open).
+
+        Combined with FIX #29 (positions are now managed all the way to
+        square_off) and FIX #31 (option-buying SL tightened to 35%
+        max premium drop), the worst-case single-trade loss should now
+        be capped well below the daily kill threshold.
+        """
+        self._reset_if_new_day()
+        if self._kill_switch_active():
+            return True
+        return self._daily_pnl_pct() <= -float(self._risk_cfg.max_daily_loss_pct)
 
     def profit_target_hit(self) -> bool:
         """Return True if today's P&L (incl. unrealized) has reached the

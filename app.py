@@ -61,6 +61,7 @@ from bot.instruments.fno import (
 from bot.journal import (
     daily_summary,
     eod_report,
+    pnl_history,
     trades_csv,
     trades_jsonl,
 )
@@ -123,6 +124,19 @@ def _cached_latest_quote(symbol: str):
 @st.cache_data(ttl=30)
 def _cached_daily_summary(day, segment: Segment):
     return daily_summary(day, segment=segment)
+
+
+@st.cache_data(ttl=60)
+def _cached_pnl_history(lookback_days: int, segment_value):
+    """Wrapper so Streamlit can hash the cache key.
+
+    ``segment_value`` is either ``None`` (combined) or one of
+    ``"equity"`` / ``"fno"`` (Segment.value strings — Pydantic enums
+    don't pickle deterministically across reruns, but their string
+    values do).
+    """
+    seg = None if segment_value is None else Segment(segment_value)
+    return pnl_history(lookback_days, segment=seg)
 
 
 # ── Theming ──────────────────────────────────────────────────────────────────
@@ -705,6 +719,305 @@ def render_open_positions(positions: list[dict]) -> list:
                 )
             st.markdown("---")
     return pos_econ
+
+
+# ────────────────────────── Daily-P&L history (compact + full) ──────────────
+
+def _pnl_color(value: float) -> str:
+    if value > 0:
+        return "#16a34a"   # green
+    if value < 0:
+        return "#dc2626"   # red
+    return "#9ca3af"       # gray (no-trade days)
+
+
+def render_pnl_history_strip(*, segment: Segment, lookback_days: int = 30) -> None:
+    """Compact bar chart of last ``lookback_days`` per-day P&L for the
+    selected segment. Lives under the open-positions card on the
+    Overview tab.
+
+    Postmortem 2026-05-15 directly motivated this: a single -₹31K
+    catastrophic day was invisible at-a-glance — the operator only
+    realised the magnitude after pulling individual EOD reports.
+    Surfacing 30-day shape (median, # losing days, max drawdown
+    visible alongside today's number) makes the trend governable.
+    """
+    rows = _cached_pnl_history(lookback_days, segment.value)
+    if not rows:
+        st.markdown(
+            f"<div class='card'><div class='section-h'>📅 30-day P&L · {segment.label}</div>"
+            f"<div style='color:#6b7280; font-size:0.86rem; padding:0.4rem 0;'>"
+            f"No trade journals on disk yet for {segment.label.lower()}. "
+            f"Bars will populate after the first day with closed trades.</div></div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    pnls = df["net_pnl"].astype(float)
+
+    total = float(pnls.sum())
+    median = float(pnls.median())
+    n_winning = int((pnls > 0).sum())
+    n_losing = int((pnls < 0).sum())
+    n_flat = int((pnls == 0).sum())
+    max_win = float(pnls.max()) if len(pnls) else 0.0
+    max_loss = float(pnls.min()) if len(pnls) else 0.0
+    last_pnl = float(pnls.iloc[-1])
+
+    # Header line + summary chips.
+    st.markdown(
+        f"<div class='section-h'>📅 30-day daily P&L · {segment.label}</div>",
+        unsafe_allow_html=True,
+    )
+    chip_total = (
+        f"<span class='pill {'pill-green' if total >= 0 else 'pill-red'}'>"
+        f"30d total ₹{total:+,.0f}</span>"
+    )
+    chip_median = (
+        f"<span class='pill {'pill-green' if median >= 0 else 'pill-red' if median < 0 else 'pill-gray'}'>"
+        f"median ₹{median:+,.0f}/day</span>"
+    )
+    chip_record = (
+        f"<span class='pill pill-gray'>{n_winning}🟢 / {n_losing}🔴"
+        + (f" / {n_flat}⚪" if n_flat else "")
+        + f" of {len(pnls)} days</span>"
+    )
+    chip_max = (
+        f"<span class='pill pill-gray'>best ₹{max_win:+,.0f} · worst ₹{max_loss:+,.0f}</span>"
+    )
+    st.markdown(
+        f"<div style='margin: 0 0 0.55rem 0;'>"
+        f"{chip_total} {chip_median} {chip_record} {chip_max}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Plotly bar chart — green/red/gray bars, today highlighted.
+    colors = [_pnl_color(v) for v in pnls]
+    if len(colors):
+        # Outline today's bar so it's clearly the most recent.
+        line_widths = [0] * len(colors)
+        line_widths[-1] = 2
+        line_colors = ["#1f2937"] * len(colors)
+    else:
+        line_widths, line_colors = [], []
+    hover_text = [
+        f"{d.strftime('%a %d %b')}<br>"
+        f"net ₹{p:+,.2f} ({rp:+.2f}%)<br>"
+        f"trades {t} · wins {w}"
+        for d, p, rp, t, w in zip(df["date"], pnls, df["return_pct"],
+                                   df["trades"], df["wins"])
+    ]
+    fig = go.Figure(go.Bar(
+        x=df["date"], y=pnls, marker_color=colors,
+        marker_line_width=line_widths,
+        marker_line_color=line_colors,
+        hovertext=hover_text, hoverinfo="text",
+        name="Net P&L",
+    ))
+    fig.add_hline(y=0, line_color="#9ca3af", line_width=1)
+    fig.update_layout(
+        height=200,
+        margin=dict(l=0, r=0, t=10, b=10),
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        yaxis=dict(title=None, tickformat=",.0f", gridcolor="rgba(127,127,127,0.15)"),
+        xaxis=dict(title=None, type="category",
+                   tickvals=df["date"].dt.strftime("%Y-%m-%d").tolist(),
+                   ticktext=df["date"].dt.strftime("%d %b").tolist(),
+                   tickangle=-30),
+    )
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+    st.caption(
+        f"Most recent bar (outlined) is {df['date'].iloc[-1].strftime('%a %d %b')}: "
+        f"₹{last_pnl:+,.2f}. Hover any bar for trade count + return %."
+    )
+
+
+def render_history_tab(*, segment: Segment) -> None:
+    """Full History tab — bar chart + sortable filterable table.
+
+    Layout:
+      [ Lookback selector (30 / 60 / 90 / All) | Segment selector ]
+      [ Headline KPIs — total, median, win-rate, max-DD, longest streak ]
+      [ Stacked bar chart — equity vs F&O contributions per day ]
+      [ Sortable per-day table with column filters ]
+    """
+    st.markdown(
+        f"<div class='section-h'>📅 Daily P&L history</div>",
+        unsafe_allow_html=True,
+    )
+
+    col_lb, col_seg = st.columns([1, 1])
+    lookback_label = col_lb.selectbox(
+        "Lookback window",
+        ["Last 30 trading days", "Last 60 trading days",
+         "Last 90 trading days", "All available"],
+        index=0,
+    )
+    lookback_map = {
+        "Last 30 trading days": 30,
+        "Last 60 trading days": 60,
+        "Last 90 trading days": 90,
+        "All available": 0,
+    }
+    lookback = lookback_map[lookback_label]
+    seg_choice = col_seg.selectbox(
+        "Segment view",
+        ["Combined (equity + F&O)", "Equity only", "F&O only"],
+        index=0,
+    )
+    seg_value = {"Combined (equity + F&O)": None,
+                 "Equity only": Segment.EQUITY.value,
+                 "F&O only": Segment.FNO.value}[seg_choice]
+
+    rows = _cached_pnl_history(lookback, seg_value)
+    if not rows:
+        st.info("No trade journals on disk for the selected segment.")
+        return
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    pnls = df["net_pnl"].astype(float)
+
+    # Headline metrics.
+    total = float(pnls.sum())
+    median = float(pnls.median())
+    mean = float(pnls.mean())
+    win_days = int((pnls > 0).sum())
+    loss_days = int((pnls < 0).sum())
+    flat_days = int((pnls == 0).sum())
+    win_pct = (win_days / max(len(pnls) - flat_days, 1)) * 100 if (win_days + loss_days) else 0
+    # Max drawdown of the cumulative P&L series.
+    cum = pnls.cumsum()
+    peak = cum.cummax()
+    max_dd = float((cum - peak).min()) if len(cum) else 0.0
+    # Longest winning / losing streak.
+    streak_curr = 0
+    streak_max_win = 0
+    streak_max_loss = 0
+    for v in pnls:
+        if v > 0:
+            streak_curr = streak_curr + 1 if streak_curr >= 0 else 1
+            streak_max_win = max(streak_max_win, streak_curr)
+        elif v < 0:
+            streak_curr = streak_curr - 1 if streak_curr <= 0 else -1
+            streak_max_loss = min(streak_max_loss, streak_curr)
+        else:
+            streak_curr = 0
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric(f"{len(pnls)}-day total",
+              f"₹{total:+,.0f}",
+              delta=f"{(total / max(len(pnls), 1)):+,.0f}/day avg",
+              delta_color="normal" if total >= 0 else "inverse")
+    k2.metric("Median day",
+              f"₹{median:+,.0f}",
+              delta=f"mean ₹{mean:+,.0f}",
+              delta_color="normal" if median >= 0 else "inverse")
+    k3.metric("Day win-rate",
+              f"{win_pct:.0f}%",
+              delta=f"{win_days}🟢 {loss_days}🔴" + (f" {flat_days}⚪" if flat_days else ""),
+              delta_color="off")
+    k4.metric("Max drawdown",
+              f"₹{max_dd:+,.0f}",
+              delta="cumulative", delta_color="off")
+    k5.metric("Longest streak",
+              f"+{streak_max_win}d / {streak_max_loss}d",
+              delta="win / loss", delta_color="off")
+
+    st.markdown("---")
+
+    # Bar chart — combined view stacks equity vs F&O.
+    if seg_value is None and "equity_net_pnl" in df.columns:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=df["date"], y=df["equity_net_pnl"],
+            name="Equity",
+            marker_color="#0ea5e9",
+            hovertemplate="%{x|%a %d %b}<br>Equity ₹%{y:+,.0f}<extra></extra>",
+        ))
+        fig.add_trace(go.Bar(
+            x=df["date"], y=df["fno_net_pnl"],
+            name="F&O",
+            marker_color="#a855f7",
+            hovertemplate="%{x|%a %d %b}<br>F&O ₹%{y:+,.0f}<extra></extra>",
+        ))
+        fig.update_layout(barmode="relative")
+    else:
+        colors = [_pnl_color(v) for v in pnls]
+        fig = go.Figure(go.Bar(
+            x=df["date"], y=pnls, marker_color=colors,
+            hovertemplate="%{x|%a %d %b}<br>net ₹%{y:+,.0f}<extra></extra>",
+        ))
+
+    fig.add_hline(y=0, line_color="#9ca3af", line_width=1)
+    fig.update_layout(
+        height=380,
+        margin=dict(l=0, r=0, t=20, b=10),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        yaxis=dict(title="Net P&L (₹)", tickformat=",.0f",
+                   gridcolor="rgba(127,127,127,0.15)"),
+        xaxis=dict(title=None, type="category",
+                   tickvals=df["date"].dt.strftime("%Y-%m-%d").tolist(),
+                   ticktext=df["date"].dt.strftime("%d %b").tolist(),
+                   tickangle=-30),
+    )
+    st.plotly_chart(fig, width="stretch", config={"displayModeBar": True})
+
+    # Sortable, filterable table.
+    st.markdown("<div class='section-h'>Per-day breakdown</div>",
+                unsafe_allow_html=True)
+    table_df = df.copy()
+    table_df["date"] = table_df["date"].dt.strftime("%a %d %b %Y")
+    keep_cols = ["date", "net_pnl", "return_pct", "trades", "wins", "losses",
+                 "win_rate", "fees", "gross_pnl"]
+    if seg_value is None:
+        keep_cols.extend(["equity_net_pnl", "fno_net_pnl",
+                          "equity_trades", "fno_trades"])
+    table_df = table_df[[c for c in keep_cols if c in table_df.columns]]
+
+    rename_map = {
+        "date": "Date",
+        "net_pnl": "Net P&L (₹)",
+        "return_pct": "Return %",
+        "trades": "Trades",
+        "wins": "Wins",
+        "losses": "Losses",
+        "win_rate": "Win rate",
+        "fees": "Fees (₹)",
+        "gross_pnl": "Gross P&L (₹)",
+        "equity_net_pnl": "Equity P&L (₹)",
+        "fno_net_pnl": "F&O P&L (₹)",
+        "equity_trades": "Equity T",
+        "fno_trades": "F&O T",
+    }
+    table_df = table_df.rename(columns=rename_map)
+    if "Win rate" in table_df.columns:
+        table_df["Win rate"] = (table_df["Win rate"] * 100).round(0).astype(int).astype(str) + "%"
+
+    # Sort newest-first by default.
+    table_df = table_df.iloc[::-1].reset_index(drop=True)
+    st.dataframe(
+        table_df, width="stretch", hide_index=True,
+        column_config={
+            "Net P&L (₹)": st.column_config.NumberColumn(format="%+,.2f"),
+            "Return %":    st.column_config.NumberColumn(format="%+.3f%%"),
+            "Fees (₹)":    st.column_config.NumberColumn(format="%,.2f"),
+            "Gross P&L (₹)": st.column_config.NumberColumn(format="%+,.2f"),
+            "Equity P&L (₹)": st.column_config.NumberColumn(format="%+,.2f"),
+            "F&O P&L (₹)":   st.column_config.NumberColumn(format="%+,.2f"),
+        },
+    )
+    st.caption(
+        "Click any column header to sort. Days with zero trades are "
+        "included as flat (₹0) rows so the calendar stays continuous."
+    )
 
 
 # ────────────────────────── Picks / underlyings panel ────────────────────────
@@ -1469,7 +1782,7 @@ render_hero_kpis(
 )
 
 # ─────────────────────────── Tabbed body ─────────────────────────────────────
-_tab_labels = ["📊 Overview", "📈 Performance", "🕯️ Charts"]
+_tab_labels = ["📊 Overview", "📈 Performance", "📅 History", "🕯️ Charts"]
 if seg == Segment.FNO:
     _tab_labels.append("Ω F&O Greeks")
 _tab_labels.append("🩺 System")
@@ -1510,16 +1823,27 @@ with _tabs[0]:
         render_picks_or_underlyings(cache=cache, segment=seg, watchlist=seg_watchlist)
         render_latest_signals(cache=cache, segment=seg)
 
+    # 30-day daily-P&L strip — added after the 2026-05-15 -₹31K post-
+    # mortem so a single catastrophic day is visible at-a-glance
+    # (today's bar is outlined for emphasis). Full breakdown lives
+    # in the dedicated History tab.
+    st.markdown("---")
+    render_pnl_history_strip(segment=seg, lookback_days=30)
+
 # Performance tab.
 with _tabs[1]:
     render_performance_tab(segment=seg, summary=_summary)
 
-# Charts tab.
+# History tab — daily P&L over a configurable lookback window.
 with _tabs[2]:
+    render_history_tab(segment=seg)
+
+# Charts tab.
+with _tabs[3]:
     render_charts_tab(segment=seg, watchlist=seg_watchlist, cfg=cfg)
 
 # F&O Greeks tab — only when F&O selected.
-_idx = 3
+_idx = 4
 if seg == Segment.FNO:
     with _tabs[_idx]:
         render_greeks_tab(positions)

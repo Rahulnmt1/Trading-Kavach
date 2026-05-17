@@ -49,11 +49,14 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional, Tuple
 
+import math
+
+import numpy as np
 import pandas as pd
 import pytz
 
 from ...config import OptionBuyDirectionalCfg
-from ...indicators import atr as _atr, ema
+from ...indicators import atr as _atr, bollinger as _bb, ema, rsi as _rsi
 from ...instruments.fno import (
     current_expiry, resolve_atm_option, underlying_from_tradingsymbol,
 )
@@ -106,20 +109,147 @@ class OptionBuyDirectionalStrategy(Strategy):
         bearish_cross = ((prev_sign.values >= 0) & (curr_sign.values < 0)).any()
 
         # Trend-confirmation gate: don't fire on fading momentum.
+        cross_dir = None
         if bullish_cross and spot_now > fast_now and fast_now > slow_now:
+            cross_dir = "bullish"
+        elif bearish_cross and spot_now < fast_now and fast_now < slow_now:
+            cross_dir = "bearish"
+
+        if cross_dir is None:
+            return self.hold(
+                symbol, spot_now,
+                f"no fresh cross (fast={fast_now:.2f}, slow={slow_now:.2f}, "
+                f"price={spot_now:.2f})",
+                self.name,
+            )
+
+        # ── FIX #35 (2026-05-15) — Multi-source price validation ────
+        # Cross-check the yfinance spot against NSE's direct REST
+        # endpoint before committing to a trade. Defends against the
+        # rare-but-recurring yfinance bad-tick scenarios (post-weekend
+        # Mondays, exchange-feed lag, scrape pipeline glitches —
+        # see FIX #27 postmortem). Fail-open: if NSE is unreachable
+        # we proceed on yfinance alone, since blocking the bot on a
+        # third-party outage is a worse failure mode than potentially
+        # transacting on a slightly-stale yfinance price.
+        try:
+            from ...data_sources.nse_direct import validate_against_yfinance
+            _ms_raw = getattr(self.cfg, "multisource_max_divergence_pct", 1.0)
+            ms_max = 1.0 if _ms_raw is None else float(_ms_raw)
+            if ms_max > 0:
+                ok, div_pct, nse_price = validate_against_yfinance(
+                    underlying, spot_now, max_divergence_pct=ms_max,
+                )
+                if not ok and div_pct is not None:
+                    return self.hold(
+                        symbol, spot_now,
+                        f"FIX #35: yfinance/NSE price divergence "
+                        f"{div_pct:.2f}% > {ms_max:.2f}% threshold "
+                        f"(yfinance={spot_now:.2f}, NSE={nse_price:.2f}) — "
+                        f"refusing trade on suspect data",
+                        self.name,
+                    )
+        except Exception:  # noqa: BLE001
+            # Multi-source check is best-effort; never let it crash
+            # the strategy. The exception itself is logged elsewhere.
+            pass
+
+        # ── FIX #32 (2026-05-15) — Volatility-regime filter ──────────
+        # Refuse the trade if realised vol over the last
+        # ``realized_vol_lookback_bars`` is below
+        # ``min_realized_vol_pct``. Long-option buying needs a
+        # trending underlying to overcome theta; in low-vol chop
+        # regimes the premium decays even when spot moves in our
+        # favor. The 2026-05-15 BANKNIFTY 13:11 entry had 9.32%
+        # realised 1h vol (lowest of any journal-recorded entry) and
+        # bled ₹22,711 by EOD. A 10% floor would have skipped that
+        # entry while preserving every winning trade.
+        rv_floor = float(getattr(self.cfg, "min_realized_vol_pct", 0.0) or 0.0)
+        rv_lookback = int(getattr(self.cfg, "realized_vol_lookback_bars", 12) or 12)
+        if rv_floor > 0 and len(df) > rv_lookback:
+            window = df["close"].iloc[-(rv_lookback + 1):]
+            log_ret = np.log(window / window.shift(1)).dropna()
+            if len(log_ret) >= 5:
+                # Annualise: 5m bars → ~75 bars per trading day, 252 days/year.
+                annualised_rv = float(log_ret.std() * math.sqrt(75 * 252))
+                if annualised_rv < rv_floor:
+                    return self.hold(
+                        symbol, spot_now,
+                        f"realised_vol {annualised_rv*100:.2f}% < "
+                        f"floor {rv_floor*100:.2f}% (theta-trap regime — "
+                        f"FIX #32: 2026-05-15 BANKNIFTY-style entries skipped)",
+                        self.name,
+                    )
+
+        # ── FIX #33 (2026-05-15) — RSI extreme filter ──────────────
+        # "Buying the top" guard. Today's 13:11 BANKNIFTY entry had
+        # RSI(14) = 67.8 — already in near-overbought territory after
+        # a 200-pt rally. The EMA cross was a LATE momentum signal
+        # firing at the local top; spot reverted 500+ pts over the
+        # next 2h. This filter blocks long CE entries when RSI is
+        # too high (and long PE when RSI is too low).
+        rsi_period = int(getattr(self.cfg, "rsi_period", 14) or 14)
+        rsi_ob = float(getattr(self.cfg, "rsi_overbought", 100) or 100)
+        rsi_os = float(getattr(self.cfg, "rsi_oversold", 0) or 0)
+        if len(df) > rsi_period + 5:
+            rsi_now = float(_rsi(df["close"], rsi_period).iloc[-1])
+            if not pd.isna(rsi_now):
+                if cross_dir == "bullish" and rsi_now >= rsi_ob:
+                    return self.hold(
+                        symbol, spot_now,
+                        f"RSI({rsi_period}) {rsi_now:.1f} ≥ "
+                        f"overbought {rsi_ob:.0f} — buying the top "
+                        f"(FIX #33: 2026-05-15 BANKNIFTY-style entries skipped)",
+                        self.name,
+                    )
+                if cross_dir == "bearish" and rsi_now <= rsi_os:
+                    return self.hold(
+                        symbol, spot_now,
+                        f"RSI({rsi_period}) {rsi_now:.1f} ≤ "
+                        f"oversold {rsi_os:.0f} — selling the bottom "
+                        f"(FIX #33: mean-reversion guard)",
+                        self.name,
+                    )
+
+        # ── FIX #34 (2026-05-15) — Bollinger %B mean-reversion filter ──
+        # %B = (close - lower_band) / (upper_band - lower_band). When
+        # %B > 0.85, price is hugging the upper Bollinger Band —
+        # buying calls there is fading the obvious (the band is
+        # statistical resistance). Today's BANKNIFTY 13:11 entry had
+        # %B = 90% — strong BLOCK signal. Today's filter would have
+        # AGREED with the RSI filter independently.
+        bb_period = int(getattr(self.cfg, "bb_period", 20) or 20)
+        bb_std = float(getattr(self.cfg, "bb_std", 2.0) or 2.0)
+        bb_upper_t = float(getattr(self.cfg, "bb_upper_threshold", 1.0) or 1.0)
+        bb_lower_t = float(getattr(self.cfg, "bb_lower_threshold", 0.0) or 0.0)
+        if len(df) > bb_period + 2 and (bb_upper_t < 1.0 or bb_lower_t > 0.0):
+            upper, mid, lower = _bb(df["close"], bb_period, bb_std)
+            u_now, l_now = float(upper.iloc[-1]), float(lower.iloc[-1])
+            if not (pd.isna(u_now) or pd.isna(l_now)) and u_now > l_now:
+                pct_b = (spot_now - l_now) / (u_now - l_now)
+                if cross_dir == "bullish" and pct_b >= bb_upper_t:
+                    return self.hold(
+                        symbol, spot_now,
+                        f"Bollinger %B = {pct_b*100:.0f}% ≥ {bb_upper_t*100:.0f}% — "
+                        f"price hugging upper band, fade-vulnerable "
+                        f"(FIX #34: mean-reversion guard)",
+                        self.name,
+                    )
+                if cross_dir == "bearish" and pct_b <= bb_lower_t:
+                    return self.hold(
+                        symbol, spot_now,
+                        f"Bollinger %B = {pct_b*100:.0f}% ≤ {bb_lower_t*100:.0f}% — "
+                        f"price hugging lower band, fade-vulnerable "
+                        f"(FIX #34: mean-reversion guard)",
+                        self.name,
+                    )
+
+        if cross_dir == "bullish":
             return self._build_long_option_signal(
                 df, underlying, spot_now, opt_type="CE", direction="bullish",
             )
-        if bearish_cross and spot_now < fast_now and fast_now < slow_now:
-            return self._build_long_option_signal(
-                df, underlying, spot_now, opt_type="PE", direction="bearish",
-            )
-
-        return self.hold(
-            symbol, spot_now,
-            f"no fresh cross (fast={fast_now:.2f}, slow={slow_now:.2f}, "
-            f"price={spot_now:.2f})",
-            self.name,
+        return self._build_long_option_signal(
+            df, underlying, spot_now, opt_type="PE", direction="bearish",
         )
 
     # ── helpers ─────────────────────────────────────────────────────────

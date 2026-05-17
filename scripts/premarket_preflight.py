@@ -863,12 +863,282 @@ def maker_run_regression_suite() -> tuple[str, str, dict]:
                 "lines/day signature from 2026-05-11).",
                 {"fix": "27"})
 
+    # ── FIX #29 — Position management until square_off ──────────────────
+    # On 2026-05-15 BANKNIFTY26MAY54200CE rode unmanaged from 13:30
+    # (trade_cutoff) to 15:15 (square_off), turning a -₹6,683 SL fill
+    # into a -₹22,711.61 forced EOD close. Same pattern killed
+    # NESTLEIND on 2026-04-29 and INFY on 2026-05-12. Fix: tick() now
+    # uses the wider in_management_window (trade_start..square_off)
+    # for SL/TP/trail checks, regardless of whether new entries are
+    # still allowed.
+    try:
+        from bot.executor import Executor as _Executor
+        from bot.risk import RiskManager as _RM
+    except Exception as e:                                       # noqa: BLE001
+        return (Status.FAIL, f"could not import bot.executor/risk: {e}",
+                {"fix": "29"})
+    tick_src = inspect.getsource(_Executor.tick)
+    if "in_management_window" not in tick_src or "FIX #29" not in tick_src:
+        return (Status.FAIL,
+                "FIX #29 regressed: Executor.tick no longer manages open "
+                "positions in the wider trade_start..square_off window. "
+                "The 2026-05-15 BANKNIFTY ride-to-EOD scenario can recur — "
+                "an open position past 13:30 will not have its SL/TP/trail "
+                "checked until forced square-off at 15:15.",
+                {"fix": "29"})
+    if not hasattr(_RM, "in_management_window"):
+        return (Status.FAIL,
+                "FIX #29 regressed: RiskManager.in_management_window "
+                "removed.", {"fix": "29"})
+
+    # ── FIX #30 — Open-position kill switch ─────────────────────────────
+    # On 2026-05-15 F&O closed -6.03% (3× past the -2% kill threshold)
+    # because the daily-loss gate only blocked NEW entries, not
+    # already-open positions whose premium decayed past the per-trade
+    # SL. tick() now calls daily_loss_kill_breached() after the manage
+    # pass and force-closes the book via _end_of_day when fired.
+    if not hasattr(_RM, "daily_loss_kill_breached"):
+        return (Status.FAIL,
+                "FIX #30 regressed: RiskManager.daily_loss_kill_breached "
+                "removed — open-position kill switch is gone.",
+                {"fix": "30"})
+    if "daily_loss_kill_breached" not in tick_src or "FIX #30" not in tick_src:
+        return (Status.FAIL,
+                "FIX #30 regressed: Executor.tick no longer checks "
+                "daily_loss_kill_breached. An open position can again "
+                "breach the -2% daily kill without force-closing the book.",
+                {"fix": "30"})
+
+    # ── FIX #31 — Tighter option-buy SL floor ────────────────────────────
+    # 2026-05-15 BANKNIFTY26MAY54200CE -₹22.7K — pre-fix
+    # min_sl_premium_pct of 0.30 allowed up to 70% premium drop. New
+    # default 0.65 caps max drop at 35%.
+    try:
+        from bot.config import OptionBuyDirectionalCfg as _ObdCfg
+    except Exception as e:                                       # noqa: BLE001
+        return (Status.FAIL, f"could not import OptionBuyDirectionalCfg: {e}",
+                {"fix": "31"})
+    if _ObdCfg().min_sl_premium_pct < 0.60:
+        return (Status.FAIL,
+                f"FIX #31 regressed: OptionBuyDirectionalCfg default "
+                f"min_sl_premium_pct = {_ObdCfg().min_sl_premium_pct} < "
+                f"0.60. Option premium can drop > 40% before SL fires "
+                f"(2026-05-15 BANKNIFTY scenario).",
+                {"fix": "31"})
+
+    # ── FIX #32 — Volatility-regime filter ──────────────────────────────
+    # Today's 13:11 BANKNIFTY catastrophe fired the EMA20/50 cross but
+    # realised 1h vol was only 9-11% (chop / theta-trap regime).
+    # Premium decayed 36% by EOD. Filter: refuse the trade if
+    # annualised 1h realised vol < min_realized_vol_pct (default 12%).
+    if not hasattr(_ObdCfg(), "min_realized_vol_pct"):
+        return (Status.FAIL,
+                "FIX #32 regressed: OptionBuyDirectionalCfg.min_realized_vol_pct "
+                "removed — theta-trap entries can recur (2026-05-15 BANKNIFTY).",
+                {"fix": "32"})
+    if _ObdCfg().min_realized_vol_pct < 0.05:
+        return (Status.FAIL,
+                f"FIX #32 regressed: min_realized_vol_pct = "
+                f"{_ObdCfg().min_realized_vol_pct} < 0.05 — filter is "
+                f"essentially disabled.",
+                {"fix": "32"})
+    try:
+        from bot.strategies.fno.option_buy import OptionBuyDirectionalStrategy as _Obd
+    except Exception as e:                                       # noqa: BLE001
+        return (Status.FAIL, f"could not import OptionBuyDirectionalStrategy: {e}",
+                {"fix": "32"})
+    obd_src = inspect.getsource(_Obd.generate)
+    if "min_realized_vol_pct" not in obd_src or "annualised_rv" not in obd_src:
+        return (Status.FAIL,
+                "FIX #32 regressed: option_buy_directional.generate no longer "
+                "applies the realised-vol filter.",
+                {"fix": "32"})
+
+    # ── FIX #33 — RSI extreme filter (mean-reversion guard) ────────────
+    # Today's 13:11 BANKNIFTY entry had RSI 67.8 (CE buy at the top of
+    # a 200-pt rally); the 11:26 PE buy had RSI 32.2 (selling the
+    # bottom). Both classic institutional fades. FIX #33 refuses CE
+    # buys at RSI ≥ rsi_overbought and PE buys at RSI ≤ rsi_oversold.
+    if not hasattr(_ObdCfg(), "rsi_overbought") or not hasattr(_ObdCfg(), "rsi_oversold"):
+        return (Status.FAIL,
+                "FIX #33 regressed: OptionBuyDirectionalCfg.rsi_overbought/rsi_oversold "
+                "removed — buy-the-top entries can recur.",
+                {"fix": "33"})
+    if _ObdCfg().rsi_overbought > 75.0 or _ObdCfg().rsi_overbought < 60.0:
+        return (Status.FAIL,
+                f"FIX #33 regressed: rsi_overbought = "
+                f"{_ObdCfg().rsi_overbought} outside [60, 75]; calibration drifted.",
+                {"fix": "33"})
+    if _ObdCfg().rsi_oversold < 25.0 or _ObdCfg().rsi_oversold > 40.0:
+        return (Status.FAIL,
+                f"FIX #33 regressed: rsi_oversold = "
+                f"{_ObdCfg().rsi_oversold} outside [25, 40]; calibration drifted.",
+                {"fix": "33"})
+    if "FIX #33" not in obd_src or "rsi_overbought" not in obd_src:
+        return (Status.FAIL,
+                "FIX #33 regressed: option_buy_directional.generate no longer "
+                "references the RSI filter.",
+                {"fix": "33"})
+
+    # ── FIX #34 — Bollinger %B mean-reversion filter ───────────────────
+    # Today's 13:11 BANKNIFTY entry had %B = 90% — price hugging the
+    # upper band, statistically resistance-vulnerable. FIX #34 refuses
+    # CE buys at %B ≥ bb_upper_threshold and PE buys at %B ≤
+    # bb_lower_threshold.
+    if not hasattr(_ObdCfg(), "bb_upper_threshold"):
+        return (Status.FAIL,
+                "FIX #34 regressed: OptionBuyDirectionalCfg.bb_upper_threshold "
+                "removed — fade-vulnerable entries can recur.",
+                {"fix": "34"})
+    if _ObdCfg().bb_upper_threshold < 0.75 or _ObdCfg().bb_upper_threshold > 1.0:
+        return (Status.FAIL,
+                f"FIX #34 regressed: bb_upper_threshold = "
+                f"{_ObdCfg().bb_upper_threshold} outside [0.75, 1.0]; "
+                f"calibration drifted.",
+                {"fix": "34"})
+    if "FIX #34" not in obd_src or "bb_upper_threshold" not in obd_src:
+        return (Status.FAIL,
+                "FIX #34 regressed: option_buy_directional.generate no longer "
+                "references the Bollinger %B filter.",
+                {"fix": "34"})
+
+    # ── FIX #35 — Multi-source price validation ────────────────────────
+    # Cross-checks yfinance spot against NSE's free public REST endpoint
+    # before placing a trade. Fail-open: NSE outage doesn't halt the
+    # bot. Refuses trade if divergence > multisource_max_divergence_pct
+    # (default 1.0%).
+    if not hasattr(_ObdCfg(), "multisource_max_divergence_pct"):
+        return (Status.FAIL,
+                "FIX #35 regressed: OptionBuyDirectionalCfg.multisource_max_divergence_pct "
+                "removed — yfinance-only trade entry is back.",
+                {"fix": "35"})
+    if _ObdCfg().multisource_max_divergence_pct < 0.5 or _ObdCfg().multisource_max_divergence_pct > 2.0:
+        return (Status.FAIL,
+                f"FIX #35 regressed: multisource_max_divergence_pct = "
+                f"{_ObdCfg().multisource_max_divergence_pct} outside [0.5, 2.0].",
+                {"fix": "35"})
+    if "FIX #35" not in obd_src or "validate_against_yfinance" not in obd_src:
+        return (Status.FAIL,
+                "FIX #35 regressed: option_buy_directional.generate no longer "
+                "references the multi-source validator.",
+                {"fix": "35"})
+    # Verify the NSE-direct module exists and exposes the API.
+    try:
+        from bot.data_sources.nse_direct import (  # noqa: F401
+            spot_price as _ns_spot,
+            validate_against_yfinance as _ns_validate,
+        )
+    except Exception as _exc:  # noqa: BLE001
+        return (Status.FAIL,
+                f"FIX #35 regressed: bot.data_sources.nse_direct import failed: {_exc}",
+                {"fix": "35"})
+
+    # ── FIX #36 — Pluggable data-source registry (Phase 5A) ─────────────
+    # FIX #36 introduces bot/data_sources/ as the single point of control
+    # for which market-data backend serves the bot. Default remains
+    # yfinance; Dhan is the Phase 5A target. Resilience: a non-yfinance
+    # primary is always wrapped in a FallbackDataSource(primary, yfinance)
+    # so a Dhan outage degrades silently to yfinance for that one tick.
+    try:
+        from bot.data_sources import (  # noqa: F401
+            DataSource as _DS,
+            FallbackDataSource as _FBDS,
+            get_data_source as _get_ds,
+            reset_registry as _reset_reg,
+        )
+        from bot.data_sources.yfinance_source import YFinanceDataSource as _YFDS
+        from bot.data_sources.dhan_source import DhanDataSource as _DDS  # noqa: F401
+        from bot.data_sources.dhan_resolver import resolve_symbol as _resolve  # noqa: F401
+    except Exception as _exc:  # noqa: BLE001
+        return (Status.FAIL,
+                f"FIX #36 regressed: bot.data_sources import failed: {_exc}",
+                {"fix": "36"})
+
+    # Default must remain yfinance — anyone running the bot without
+    # configuring DATA_SOURCE sees pre-Phase-5 behaviour.
+    _saved_ds = os.environ.pop("DATA_SOURCE", None)
+    try:
+        _reset_reg()
+        _active = _get_ds()
+        if not isinstance(_active, _YFDS):
+            return (Status.FAIL,
+                    f"FIX #36 regressed: default backend is "
+                    f"{type(_active).__name__}, expected YFinanceDataSource",
+                    {"fix": "36"})
+    finally:
+        if _saved_ds is not None:
+            os.environ["DATA_SOURCE"] = _saved_ds
+        _reset_reg()
+
+    # Routing helper must be wired into bot.data.
+    from bot import data as _bot_data
+    if not hasattr(_bot_data, "_maybe_route_to_alternate_source"):
+        return (Status.FAIL,
+                "FIX #36 regressed: bot.data._maybe_route_to_alternate_source removed",
+                {"fix": "36"})
+    _src_intraday = inspect.getsource(_bot_data.intraday_bars)
+    _src_history = inspect.getsource(_bot_data.history)
+    if "_maybe_route_to_alternate_source" not in _src_intraday:
+        return (Status.FAIL,
+                "FIX #36 regressed: bot.data.intraday_bars no longer consults the registry",
+                {"fix": "36"})
+    if "_maybe_route_to_alternate_source" not in _src_history:
+        return (Status.FAIL,
+                "FIX #36 regressed: bot.data.history no longer consults the registry",
+                {"fix": "36"})
+
+    # ── FIX #37 — Fee-aware entry gate ──────────────────────────────────
+    # FIX #37 closes the cost-management loop by REJECTING any trade
+    # whose expected round-trip fees exceed N% of the expected gross
+    # at TP. Without the gate, fees are merely measured (FIX #21r
+    # rates are accurate) — not used to make decisions. The gate
+    # short-circuits 0.3-0.5% scalp-y signals where the fee drag
+    # alone consumes 25%+ of the optimistic gross.
+    from bot.risk import RiskManager as _RM37
+    from bot.config import RiskCfg as _RiskCfg37, load_config as _lc37
+    if not hasattr(_RM37, "_check_fee_edge"):
+        return (Status.FAIL,
+                "FIX #37 regressed: RiskManager._check_fee_edge missing",
+                {"fix": "37"})
+    if not hasattr(_RiskCfg37, "model_fields") or "max_fee_pct_of_gross" not in _RiskCfg37.model_fields:
+        return (Status.FAIL,
+                "FIX #37 regressed: RiskCfg.max_fee_pct_of_gross knob missing",
+                {"fix": "37"})
+    _src_eval37 = inspect.getsource(_RM37.evaluate)
+    for _gate_tag in ("FIX #37 (2026-05-16) — fee-aware gate (options)",
+                      "FIX #37 (2026-05-16) — fee-aware gate (futures)",
+                      "FIX #37 (2026-05-16) — fee-aware gate (equity)"):
+        if _gate_tag not in _src_eval37:
+            return (Status.FAIL,
+                    f"FIX #37 regressed: RiskManager.evaluate missing approval-path "
+                    f"sentinel ({_gate_tag!r})",
+                    {"fix": "37"})
+    # The live config must have a sane threshold — too low (≤ 0) or too
+    # high (≥ 100) silently disables the gate. Equity reads the
+    # top-level `risk:` block; F&O reads `fno.risk:` — pin both.
+    _cfg37 = _lc37()
+    _eq_threshold = float(getattr(_cfg37.risk, "max_fee_pct_of_gross", 0.0) or 0.0)
+    _fno_threshold = float(getattr(_cfg37.fno.risk, "max_fee_pct_of_gross", 0.0) or 0.0)
+    for seg, val in (("equity", _eq_threshold), ("fno", _fno_threshold)):
+        if not (0.0 < val < 100.0):
+            return (Status.FAIL,
+                    f"FIX #37 regressed: {seg} max_fee_pct_of_gross = {val} "
+                    f"out of (0, 100) range — gate disabled",
+                    {"fix": "37"})
+
     return (Status.PASS,
             "FIX #12 (synthetic pricing) + FIX #13 (EOD race + over-sell) + "
             "FIX #14 (F&O EMA50 pre-warm) + FIX #15 (F&O-aware daily-loss) + "
-            "FIX #27 (yfinance retry + stale-cache) pinned",
-            {"checks": len(cases) + 2 + 4 + 2 + 4 + 4,
-             "fixes_pinned": ["12", "13a", "13b", "14", "15", "27"]})
+            "FIX #27 (yfinance retry + stale-cache) + FIX #29 (manage until "
+            "square_off) + FIX #30 (open-pos kill) + FIX #31 (option-buy SL "
+            "floor 0.65) + FIX #32 (theta-trap filter 12%) + FIX #33 (RSI "
+            "mean-reversion guard) + FIX #34 (Bollinger %B fade guard) + "
+            "FIX #35 (multi-source NSE cross-check) + FIX #36 (Phase 5A "
+            "pluggable data-source registry) + FIX #37 (fee-aware entry "
+            "gate) pinned",
+            {"checks": len(cases) + 2 + 4 + 2 + 4 + 4 + 3 + 1 + 4 + 3 + 4 + 4 + 5,
+             "fixes_pinned": ["12", "13a", "13b", "14", "15", "27",
+                              "29", "30", "31", "32", "33", "34", "35", "36", "37"]})
 
 
 # ─── Phase 3 (Decision checkers) — read post-maker state ────────────────────

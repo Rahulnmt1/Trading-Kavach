@@ -234,7 +234,51 @@ class Executor:
             self._end_of_day()
             return
 
+        # ── 1. Manage open positions ALWAYS in the session window ─────────
+        # FIX #29 (2026-05-15) — this used to live INSIDE the
+        # ``in_trading_window`` branch below, which gated on
+        # ``trade_cutoff`` (13:30). After 13:30 the tick returned early
+        # and SL/TP/trail checks stopped running for 1h 45m until forced
+        # square-off at 15:15. Three confirmed losses traceable to this
+        # bug:
+        #
+        #   * 2026-04-29 NESTLEIND ride-to-EOD (1h 33m unmanaged)
+        #   * 2026-05-12 INFY SHORT drift (-₹644 EOD square-off)
+        #   * 2026-05-15 BANKNIFTY26MAY54200CE -₹22,711.61 EOD square-off
+        #     (synthetic premium SL was crossed at 13:48 — bot would
+        #     have exited at -₹6,683 if managed; instead drifted to
+        #     -₹22,712 by 15:15 = 3.4× the per-trade SL cap)
+        #
+        # Position management must run between ``trade_start`` (no
+        # point earlier — market is closed) and ``square_off`` (after
+        # which ``_end_of_day`` takes over). The new entry pipeline
+        # below still gates on ``trade_cutoff`` separately.
+        positions_open = [p for p in self.broker.positions() if p.qty != 0]
+        if positions_open and self.risk.in_management_window(now.time()):
+            self._manage_open_positions(now)
+
+            # FIX #30 (2026-05-15) — Open-position kill switch. After
+            # the manage pass, if today's loss has breached the
+            # ``max_daily_loss_pct`` threshold we force-square-off ALL
+            # remaining positions and end the trading day. The existing
+            # daily-loss gate inside :meth:`RiskManager.evaluate` only
+            # blocks NEW entries; an already-open position whose
+            # premium decay (theta + adverse spot) has run past the
+            # per-trade SL can still bleed beyond the daily cap. This
+            # check catches that.
+            if self.risk.daily_loss_kill_breached():
+                logger.warning(
+                    "[{}] daily-loss kill switch breached — squaring off "
+                    "ALL open positions (FIX #30)",
+                    self.segment.value,
+                )
+                self._end_of_day()
+                return
+
+        # Past trade_cutoff: positions are managed (above), but no new
+        # entries this tick. Refresh dashboard state and exit.
         if not self.risk.in_trading_window(now.time()):
+            self._publish_state()
             return
 
         # ── F&O Phase 1 idle short-circuit ───────────────────────────────
@@ -244,8 +288,7 @@ class Executor:
         # day so the operator knows the bot is alive and the no-op is
         # intentional, not a hung tick. Phase 2 will register futures
         # strategies and this branch becomes a no-op.
-        if (not self.ensemble.members
-                and not [p for p in self.broker.positions() if p.qty != 0]):
+        if not self.ensemble.members and not positions_open:
             today = now.date()
             if self._idle_logged_for_day != today:
                 logger.info("[{}] no strategies registered — idling. "
@@ -254,12 +297,6 @@ class Executor:
                 self._idle_logged_for_day = today
             self._publish_state()
             return
-
-        # ── 1. Manage existing positions FIRST ────────────────────────────
-        # SL/TP/trailing checks against the latest 1-minute bar. Any open
-        # position whose price has crossed its stop or target is closed
-        # before we look for new entries.
-        self._manage_open_positions(now)
 
         # ── 2. Daily profit lock-in ───────────────────────────────────────
         if not self._profit_locked and self.risk.profit_target_hit():

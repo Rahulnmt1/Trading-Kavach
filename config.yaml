@@ -5,6 +5,19 @@
 # after backtesting and a 2-week paper-trading run with no losses.
 # =================================================================
 
+# FIX #36 (2026-05-16) — Pluggable market-data source (Phase 5A).
+# Replaces the previous "yfinance everywhere" assumption with a
+# Protocol-based architecture. Today's options:
+#   yfinance  - free Yahoo scrape (default, preserves prior behaviour)
+#   dhan      - real-time NSE feed via Dhan REST + WebSocket. Free
+#               with a Dhan trading account; needs DHAN_CLIENT_ID
+#               and DHAN_ACCESS_TOKEN in .env.
+#   auto      - try Dhan first, fall back to yfinance.
+# Override via DATA_SOURCE env var (highest priority).
+market_data:
+  source:   yfinance
+  fallback: yfinance
+
 capital:
   # 2026-05-08 — Lever A (post-Option-2 review). Bumped 100,000 → 300,000
   # (paper) after the live-day analysis showed both 2026-05-08 equity
@@ -86,6 +99,14 @@ risk:
   # — i.e. essentially "never fires for equity" by design (see Lever-A
   # comment under ``capital``). Revisit after 5 live trading days.
   daily_profit_target_pct: 5.0
+  # FIX #37 (2026-05-16) — Fee-aware entry gate.
+  # Refuse any trade whose expected round-trip fees (entry + exit at TP)
+  # exceed this percentage of expected gross profit. Uses the actual
+  # post-FIX-#21r fee schedule for equity/futures/options. Spread and
+  # iron-condor strategies are EXEMPT (defined-risk credit P&L mechanics).
+  # Set to 100 (or 0) to disable. Default 25 leaves a small margin
+  # against the historical 60-day F&O fee-drag distribution.
+  max_fee_pct_of_gross: 25.0
 
 session:
   market_open: "09:15"
@@ -423,6 +444,14 @@ fno:
     # absolute lock-in at the SAME ₹5K threshold the bot has used
     # historically, so the operator's mental model doesn't shift.
     daily_profit_target_pct: 1.0
+    # FIX #37 (2026-05-16) — Fee-aware entry gate (F&O). Same semantics
+    # as the equity-side knob; option_buy_directional has the highest
+    # fee-drag exposure (each round trip is ~₹100-150 of options STT +
+    # GST + brokerage + exchange charges, against TP-gross of typically
+    # ₹2K-15K per trade). 25% threshold leaves headroom against the
+    # 60-day backtest's median fee/gross ratio of ~12%, so the gate
+    # rejects only the genuinely-marginal entries.
+    max_fee_pct_of_gross: 25.0
   watchlist:
     # Bare underlyings — resolved into futures tradingsymbol (Phase 2)
     # OR into ATM CE/PE option tradingsymbol at signal time (Phase 3).
@@ -483,7 +512,39 @@ fno:
       cross_lookback_bars: 10  # See futures_trend for explanation
       iv: 0.15
       risk_free_rate: 0.07
-      min_sl_premium_pct: 0.30
+      # FIX #31 (2026-05-15): 0.30 → 0.65 — caps max allowed premium
+      # drop at 35% before SL fires. See OptionBuyDirectionalCfg
+      # docstring for the BANKNIFTY26MAY54200CE -₹22.7K postmortem.
+      min_sl_premium_pct: 0.65
+      # FIX #32 (2026-05-15) — Skip option-buy entries in low-realised-
+      # vol "theta-trap" regimes. Today's 13:11 BANKNIFTY entry had
+      # realised 1h vol of 9.32-10.77% and the premium decayed 36% by
+      # EOD despite an EMA cross firing. Calibrated against 6 historical
+      # signal events: a 12% floor blocks today's catastrophe (well
+      # below threshold) while preserving every TP winner (≥14%). Set
+      # to 0 to disable.
+      min_realized_vol_pct: 0.12
+      realized_vol_lookback_bars: 12     # 12 × 5m = 1h of bars
+      # FIX #33 (2026-05-15) — RSI mean-reversion guard. Block CE buy
+      # when RSI(14) ≥ 65 (price already overbought, EMA cross is a
+      # late momentum signal firing at a local top). Block PE buy
+      # when RSI ≤ 35 (mirror). Set to 100/0 to disable.
+      rsi_period: 14
+      rsi_overbought: 65.0
+      rsi_oversold: 35.0
+      # FIX #34 (2026-05-15) — Bollinger %B mean-reversion guard.
+      # Block CE buy when %B ≥ 0.85 (close hugging upper band).
+      # Block PE buy when %B ≤ 0.15. Set to 1.0/0.0 to disable.
+      bb_period: 20
+      bb_std: 2.0
+      bb_upper_threshold: 0.85
+      bb_lower_threshold: 0.15
+      # FIX #35 (2026-05-15) — Multi-source price validation. Before
+      # entering a trade, cross-check yfinance spot against NSE's
+      # free public REST API. If divergence > 1% we refuse the
+      # trade. Fail-open: if NSE is unreachable, proceed on
+      # yfinance. Set to 0 to disable.
+      multisource_max_divergence_pct: 1.0
     credit_spread:             # Used only when 'credit_spread' in `enabled'
       ema_fast: 20
       ema_slow: 50
