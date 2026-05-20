@@ -17,3 +17,15 @@ logs/
 # released on shutdown) — segment-specific, must never be checked in
 # or pushed since they reflect the local machine's bot processes.
 .bot.lock.*
+
+# Local backups (timestamped *.bak.<date>, dashboard backups, log-folder
+# snapshots created before a consolidation). Useful on the dev machine,
+# noise in the public repo — and may contain personal trade history.
+*.bak.*
+*_bkp_*.py
+dashboard_code_bkp_*.py
+logs.pre-consolidate-backup-*/
+logs.*-backup-*/
+
+# Local agent / IDE scratch directories
+.claude/

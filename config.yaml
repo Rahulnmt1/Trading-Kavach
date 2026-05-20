@@ -15,7 +15,7 @@
 #   auto      - try Dhan first, fall back to yfinance.
 # Override via DATA_SOURCE env var (highest priority).
 market_data:
-  source:   yfinance
+  source: yfinance
   fallback: yfinance
 
 capital:
@@ -145,10 +145,21 @@ watchlist:
   # below 0 it gets dropped; if a dropped one returns to positive
   # for two consecutive weeks it gets added back.
   symbols:
-    - HDFCBANK
-    - INFY
     - SBIN
-    - INDUSINDBK
+    - MOTHERSON
+    - BIOCON
+    - BHARTIARTL
+    - PNB
+    - ADANIENT
+    - DRREDDY
+    - KOTAKBANK
+    - CIPLA
+    - TCS
+    - POLICYBZR
+    - TATACONSUM
+    - SUNPHARMA
+    - ONGC
+    - WIPRO
 strategies:
   # 2026-05-06: dropped vwap_revert from the enabled list. It is a pure
   # counter-trend strategy (fade rallies / catch falling knives) that on

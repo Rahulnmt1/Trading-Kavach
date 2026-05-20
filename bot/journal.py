@@ -46,6 +46,7 @@ import pytz
 
 from .broker.base import Order, OrderSide, OrderStatus, Position
 from .config import PROJECT_ROOT, load_config
+from .fees import compute_fees
 from .logger import logger
 from .segment import Segment, cfg_capital, journal_subdir
 
@@ -85,6 +86,150 @@ def _hhmmss(iso_ts: Optional[str]) -> str:
         return datetime.fromisoformat(iso_ts).strftime("%H:%M:%S")
     except Exception:
         return iso_ts[-8:]
+
+
+# ============================================================================
+# fee-breakdown helpers (per-trade brokerage vs taxes split)
+# ============================================================================
+#
+# The journal stores ``fees`` as a single lump-sum number per round-trip.
+# For the dashboard's per-day "what did the broker / govt take" view we need
+# the split into brokerage (broker's cut) vs taxes-&-statutory-charges (govt
+# + exchange + SEBI). This is the same split Zerodha / Upstox / Dhan use on
+# their charges pages, so it matches how a retail trader thinks about costs.
+#
+# We persist the breakdown into TRADE_CLOSED records going forward (cheap —
+# one ``compute_fees`` per leg at close time) AND re-derive it on the fly
+# for older records that predate this field, so the dashboard works for the
+# full journal history without a migration.
+
+def _fee_segment_for_symbol(symbol: str, segment: Segment) -> str:
+    """Map (symbol, segment) → ``compute_fees`` ``segment`` argument.
+
+    Mirrors ``bot.broker.paper._fee_segment_for`` but works from the
+    journaled symbol string (we don't store ``InstrumentKind`` in the
+    journal). Equity-segment symbols are always plain equity tickers.
+    F&O-segment symbols can be option / spread / iron-condor / future —
+    detected via the same parsers the executor uses at order time.
+    """
+    if segment != Segment.FNO:
+        return "equity"
+    try:
+        from .instruments.fno import (
+            parse_iron_condor_tradingsymbol,
+            parse_option_tradingsymbol,
+            parse_spread_tradingsymbol,
+        )
+    except Exception:
+        return "options"
+    if parse_iron_condor_tradingsymbol(symbol) is not None:
+        return "options"   # 4-leg structure, but each leg priced as options
+    if parse_spread_tradingsymbol(symbol) is not None:
+        return "options"   # 2-leg structure, each leg priced as options
+    if parse_option_tradingsymbol(symbol) is not None:
+        return "options"
+    return "futures"
+
+
+def _extra_leg_brokerage_surcharge(symbol: str, segment: Segment) -> float:
+    """Multi-leg F&O structures attract one ₹20 brokerage charge per
+    additional leg. Mirrors ``bot.broker.paper._fees``."""
+    if segment != Segment.FNO:
+        return 0.0
+    try:
+        from .instruments.fno import (
+            parse_iron_condor_tradingsymbol,
+            parse_spread_tradingsymbol,
+        )
+    except Exception:
+        return 0.0
+    if parse_iron_condor_tradingsymbol(symbol) is not None:
+        return 60.0   # 3 extra legs × ₹20
+    if parse_spread_tradingsymbol(symbol) is not None:
+        return 20.0   # 1 extra leg
+    return 0.0
+
+
+def _compute_trade_charge_split(*, symbol: str, side: str, qty: int,
+                                entry_price: float, exit_price: float,
+                                segment: Segment) -> Dict[str, float]:
+    """Return ``{"brokerage": ..., "taxes": ..., "total": ...}`` for one
+    closed round-trip trade.
+
+    "Taxes" follows the Zerodha-style retail split: STT + exchange
+    transaction charges + SEBI turnover fee + stamp duty + GST. Everything
+    that isn't the broker's flat/percentage fee.
+
+    Used for both:
+      * NEW closes (called from :meth:`_emit_close`) — stamped into the
+        TRADE_CLOSED record so the dashboard can sum it without re-deriving.
+      * OLD closes (called from :func:`daily_summary`) — re-derived on the
+        fly for records that predate persistence of this breakdown.
+    """
+    qty = int(qty or 0)
+    if qty <= 0 or entry_price <= 0 or exit_price <= 0:
+        return {"brokerage": 0.0, "taxes": 0.0, "total": 0.0}
+
+    fee_seg = _fee_segment_for_symbol(symbol, segment)
+    side_u = (side or "").upper()
+    if side_u in ("LONG", "BUY"):
+        entry_leg = compute_fees("BUY",  qty, float(entry_price), segment=fee_seg)
+        exit_leg  = compute_fees("SELL", qty, float(exit_price),  segment=fee_seg)
+    else:
+        entry_leg = compute_fees("SELL", qty, float(entry_price), segment=fee_seg)
+        exit_leg  = compute_fees("BUY",  qty, float(exit_price),  segment=fee_seg)
+
+    surcharge = _extra_leg_brokerage_surcharge(symbol, segment)
+    brokerage = entry_leg.brokerage + exit_leg.brokerage + surcharge
+    taxes = (
+        entry_leg.stt + exit_leg.stt
+        + entry_leg.exchange + exit_leg.exchange
+        + entry_leg.sebi + exit_leg.sebi
+        + entry_leg.stamp_duty + exit_leg.stamp_duty
+        + entry_leg.gst + exit_leg.gst
+    )
+    return {
+        "brokerage": round(brokerage, 2),
+        "taxes":     round(taxes, 2),
+        "total":     round(brokerage + taxes, 2),
+    }
+
+
+def _split_trade_fees(trade: Dict[str, Any],
+                      segment: Segment) -> Dict[str, float]:
+    """Return the brokerage / taxes split for a single TRADE_CLOSED record.
+
+    Prefers the persisted ``fees_breakdown`` (newer records); falls back
+    to recomputing from raw fields for older records. If the recomputed
+    total drifts from the authoritative ``fees`` field (rounding or a
+    SPREAD/IC surcharge change), scale brokerage + taxes proportionally
+    so they sum to ``fees`` — the ``fees`` field is what hit the broker
+    and therefore the P&L number the user actually owes.
+    """
+    persisted = trade.get("fees_breakdown")
+    if isinstance(persisted, dict) and "brokerage" in persisted and "taxes" in persisted:
+        return {
+            "brokerage": float(persisted.get("brokerage") or 0.0),
+            "taxes":     float(persisted.get("taxes") or 0.0),
+        }
+
+    split = _compute_trade_charge_split(
+        symbol=trade.get("symbol", ""),
+        side=trade.get("side", ""),
+        qty=int(trade.get("qty") or 0),
+        entry_price=float(trade.get("entry_price") or 0.0),
+        exit_price=float(trade.get("exit_price") or 0.0),
+        segment=segment,
+    )
+    actual_fees = float(trade.get("fees") or 0.0)
+    derived = split["brokerage"] + split["taxes"]
+    if derived > 0 and abs(derived - actual_fees) > 0.01:
+        scale = actual_fees / derived
+        return {
+            "brokerage": round(split["brokerage"] * scale, 2),
+            "taxes":     round(split["taxes"] * scale, 2),
+        }
+    return {"brokerage": split["brokerage"], "taxes": split["taxes"]}
 
 
 # ============================================================================
@@ -265,6 +410,12 @@ class TradeJournal:
             else:
                 exit_reason = "manual"
 
+        charge_split = _compute_trade_charge_split(
+            symbol=ot.symbol, side=ot.side, qty=ot.qty,
+            entry_price=ot.entry_price, exit_price=exit_price,
+            segment=self.segment,
+        )
+
         record = {
             "ts": datetime.now(IST).isoformat(timespec="seconds"),
             "symbol": ot.symbol,
@@ -276,13 +427,19 @@ class TradeJournal:
             "duration_min": duration_min,
             "gross_pnl": round(gross, 2),
             "fees": round(total_fees, 2),
+            "brokerage": charge_split["brokerage"],
+            "taxes": charge_split["taxes"],
             "net_pnl": round(net, 2),
             "stop_loss": ot.stop_loss,
             "take_profit": ot.take_profit,
             "strategy": ot.strategy,
             "exit_reason": exit_reason,
         }
-        self._append_event({"type": "TRADE_CLOSED", **record})
+        event_record = {**record, "fees_breakdown": {
+            "brokerage": charge_split["brokerage"],
+            "taxes":     charge_split["taxes"],
+        }}
+        self._append_event({"type": "TRADE_CLOSED", **event_record})
         self._append_csv(record)
         sign = "+" if net >= 0 else ""
         logger.info("[journal] CLOSED {} {} {}@{:.2f} → {:.2f}  net ₹{}{:.2f} ({})",
@@ -331,6 +488,13 @@ def daily_summary(day: Optional[date] = None,
     fees = sum(t["fees"] for t in trades)
     net = sum(pnls)
 
+    brokerage_total = 0.0
+    taxes_total = 0.0
+    for t in trades:
+        split = _split_trade_fees(t, segment)
+        brokerage_total += split["brokerage"]
+        taxes_total += split["taxes"]
+
     avg_win = sum(t["net_pnl"] for t in wins) / len(wins) if wins else 0.0
     avg_loss = sum(t["net_pnl"] for t in losses) / len(losses) if losses else 0.0
     gross_profit = sum(t["net_pnl"] for t in wins)
@@ -364,6 +528,8 @@ def daily_summary(day: Optional[date] = None,
         "win_rate": win_rate,
         "gross_pnl": round(gross, 2),
         "fees": round(fees, 2),
+        "brokerage": round(brokerage_total, 2),
+        "taxes": round(taxes_total, 2),
         "net_pnl": round(net, 2),
         "return_pct": round(net / capital_total * 100, 3) if capital_total else 0.0,
         "avg_win": round(avg_win, 2),
@@ -463,6 +629,8 @@ def pnl_history(lookback_days: int = 30,
                          max(eq["trades"] + fn["trades"], 1)),
             "gross_pnl": round(eq["gross_pnl"] + fn["gross_pnl"], 2),
             "fees": round(eq["fees"] + fn["fees"], 2),
+            "brokerage": round(eq.get("brokerage", 0.0) + fn.get("brokerage", 0.0), 2),
+            "taxes": round(eq.get("taxes", 0.0) + fn.get("taxes", 0.0), 2),
             "net_pnl": round(net, 2),
             "return_pct": round(net / cap_combined * 100, 3) if cap_combined else 0.0,
             "equity_net_pnl": eq["net_pnl"],
@@ -483,7 +651,9 @@ def _summary_row(day: date, segment: Segment) -> Dict[str, Any]:
             "segment": segment.value,
             "trades": 0, "wins": 0, "losses": 0,
             "win_rate": 0.0,
-            "gross_pnl": 0.0, "fees": 0.0, "net_pnl": 0.0,
+            "gross_pnl": 0.0, "fees": 0.0,
+            "brokerage": 0.0, "taxes": 0.0,
+            "net_pnl": 0.0,
             "return_pct": 0.0,
             "expectancy": 0.0,
             "profit_factor": 0.0,
@@ -497,6 +667,8 @@ def _summary_row(day: date, segment: Segment) -> Dict[str, Any]:
         "win_rate": s["win_rate"],
         "gross_pnl": s["gross_pnl"],
         "fees": s["fees"],
+        "brokerage": s.get("brokerage", 0.0),
+        "taxes": s.get("taxes", 0.0),
         "net_pnl": s["net_pnl"],
         "return_pct": s["return_pct"],
         "expectancy": s["expectancy"],

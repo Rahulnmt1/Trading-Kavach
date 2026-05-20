@@ -732,23 +732,26 @@ def _pnl_color(value: float) -> str:
 
 
 def render_pnl_history_strip(*, segment: Segment, lookback_days: int = 30) -> None:
-    """Compact bar chart of last ``lookback_days`` per-day P&L for the
-    selected segment. Lives under the open-positions card on the
+    """Per-day P&L table for the last ``lookback_days`` showing gain/loss,
+    brokerage, taxes & statutory charges, total charges, and net P&L
+    separately for each day. Lives under the open-positions card on the
     Overview tab.
 
-    Postmortem 2026-05-15 directly motivated this: a single -₹31K
-    catastrophic day was invisible at-a-glance — the operator only
-    realised the magnitude after pulling individual EOD reports.
-    Surfacing 30-day shape (median, # losing days, max drawdown
-    visible alongside today's number) makes the trend governable.
+    Postmortem 2026-05-15 directly motivated showing this at-a-glance: a
+    single -₹31K catastrophic day was invisible until the operator
+    pulled individual EOD reports. The 2026-05-19 follow-up replaced the
+    earlier bar-chart strip with this table view because the operator
+    asked to see brokerage and taxes broken out per-day — fees alone
+    quietly eat ~25-35% of a typical scalp's gross, and a per-day split
+    makes that drag visible the moment it spikes.
     """
     rows = _cached_pnl_history(lookback_days, segment.value)
     if not rows:
         st.markdown(
-            f"<div class='card'><div class='section-h'>📅 30-day P&L · {segment.label}</div>"
+            f"<div class='card'><div class='section-h'>📅 {lookback_days}-day P&L · {segment.label}</div>"
             f"<div style='color:#6b7280; font-size:0.86rem; padding:0.4rem 0;'>"
             f"No trade journals on disk yet for {segment.label.lower()}. "
-            f"Bars will populate after the first day with closed trades.</div></div>",
+            f"Rows will populate after the first day with closed trades.</div></div>",
             unsafe_allow_html=True,
         )
         return
@@ -756,24 +759,26 @@ def render_pnl_history_strip(*, segment: Segment, lookback_days: int = 30) -> No
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     pnls = df["net_pnl"].astype(float)
+    brokerage = df.get("brokerage", pd.Series([0.0] * len(df))).astype(float)
+    taxes = df.get("taxes", pd.Series([0.0] * len(df))).astype(float)
+    fees_total = df["fees"].astype(float)
 
     total = float(pnls.sum())
     median = float(pnls.median())
     n_winning = int((pnls > 0).sum())
     n_losing = int((pnls < 0).sum())
     n_flat = int((pnls == 0).sum())
-    max_win = float(pnls.max()) if len(pnls) else 0.0
-    max_loss = float(pnls.min()) if len(pnls) else 0.0
-    last_pnl = float(pnls.iloc[-1])
+    total_brokerage = float(brokerage.sum())
+    total_taxes = float(taxes.sum())
+    total_charges = float(fees_total.sum())
 
-    # Header line + summary chips.
     st.markdown(
-        f"<div class='section-h'>📅 30-day daily P&L · {segment.label}</div>",
+        f"<div class='section-h'>📅 {lookback_days}-day daily P&L · {segment.label}</div>",
         unsafe_allow_html=True,
     )
     chip_total = (
         f"<span class='pill {'pill-green' if total >= 0 else 'pill-red'}'>"
-        f"30d total ₹{total:+,.0f}</span>"
+        f"{len(pnls)}d net ₹{total:+,.0f}</span>"
     )
     chip_median = (
         f"<span class='pill {'pill-green' if median >= 0 else 'pill-red' if median < 0 else 'pill-gray'}'>"
@@ -784,56 +789,50 @@ def render_pnl_history_strip(*, segment: Segment, lookback_days: int = 30) -> No
         + (f" / {n_flat}⚪" if n_flat else "")
         + f" of {len(pnls)} days</span>"
     )
-    chip_max = (
-        f"<span class='pill pill-gray'>best ₹{max_win:+,.0f} · worst ₹{max_loss:+,.0f}</span>"
+    chip_charges = (
+        f"<span class='pill pill-amber'>charges ₹{total_charges:,.0f} "
+        f"(brokerage ₹{total_brokerage:,.0f} · taxes ₹{total_taxes:,.0f})</span>"
     )
     st.markdown(
         f"<div style='margin: 0 0 0.55rem 0;'>"
-        f"{chip_total} {chip_median} {chip_record} {chip_max}"
+        f"{chip_total} {chip_median} {chip_record} {chip_charges}"
         f"</div>",
         unsafe_allow_html=True,
     )
 
-    # Plotly bar chart — green/red/gray bars, today highlighted.
-    colors = [_pnl_color(v) for v in pnls]
-    if len(colors):
-        # Outline today's bar so it's clearly the most recent.
-        line_widths = [0] * len(colors)
-        line_widths[-1] = 2
-        line_colors = ["#1f2937"] * len(colors)
-    else:
-        line_widths, line_colors = [], []
-    hover_text = [
-        f"{d.strftime('%a %d %b')}<br>"
-        f"net ₹{p:+,.2f} ({rp:+.2f}%)<br>"
-        f"trades {t} · wins {w}"
-        for d, p, rp, t, w in zip(df["date"], pnls, df["return_pct"],
-                                   df["trades"], df["wins"])
-    ]
-    fig = go.Figure(go.Bar(
-        x=df["date"], y=pnls, marker_color=colors,
-        marker_line_width=line_widths,
-        marker_line_color=line_colors,
-        hovertext=hover_text, hoverinfo="text",
-        name="Net P&L",
-    ))
-    fig.add_hline(y=0, line_color="#9ca3af", line_width=1)
-    fig.update_layout(
-        height=200,
-        margin=dict(l=0, r=0, t=10, b=10),
-        showlegend=False,
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        yaxis=dict(title=None, tickformat=",.0f", gridcolor="rgba(127,127,127,0.15)"),
-        xaxis=dict(title=None, type="category",
-                   tickvals=df["date"].dt.strftime("%Y-%m-%d").tolist(),
-                   ticktext=df["date"].dt.strftime("%d %b").tolist(),
-                   tickangle=-30),
+    today_iso = date.today().isoformat()
+    table_df = pd.DataFrame({
+        "Date":          df["date"].dt.strftime("%a %d %b %Y"),
+        "Trades":        df["trades"].astype(int),
+        "Gross P&L (₹)": df["gross_pnl"].astype(float).round(2),
+        "Brokerage (₹)": brokerage.round(2),
+        "Taxes (₹)":     taxes.round(2),
+        "Total charges (₹)": fees_total.round(2),
+        "Net P&L (₹)":   pnls.round(2),
+        "Return %":      df["return_pct"].astype(float).round(3),
+    })
+    is_today = df["date"].dt.strftime("%Y-%m-%d") == today_iso
+    if is_today.any():
+        table_df.loc[is_today, "Date"] = "▶ " + table_df.loc[is_today, "Date"] + "  (today)"
+
+    table_df = table_df.iloc[::-1].reset_index(drop=True)
+
+    st.dataframe(
+        table_df, width="stretch", hide_index=True,
+        column_config={
+            "Gross P&L (₹)":     st.column_config.NumberColumn(format="%+.2f"),
+            "Brokerage (₹)":     st.column_config.NumberColumn(format="%.2f"),
+            "Taxes (₹)":         st.column_config.NumberColumn(format="%.2f"),
+            "Total charges (₹)": st.column_config.NumberColumn(format="%.2f"),
+            "Net P&L (₹)":       st.column_config.NumberColumn(format="%+.2f"),
+            "Return %":          st.column_config.NumberColumn(format="%+.3f%%"),
+        },
     )
-    st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     st.caption(
-        f"Most recent bar (outlined) is {df['date'].iloc[-1].strftime('%a %d %b')}: "
-        f"₹{last_pnl:+,.2f}. Hover any bar for trade count + return %."
+        f"Newest day first. Today's row is marked ▶. "
+        f"**Taxes** = STT + exchange + SEBI + stamp duty + GST. "
+        f"**Brokerage** = broker's flat/percentage fee. "
+        f"Flat (₹0) rows are days with no closed trades."
     )
 
 
@@ -976,7 +975,7 @@ def render_history_tab(*, segment: Segment) -> None:
     table_df = df.copy()
     table_df["date"] = table_df["date"].dt.strftime("%a %d %b %Y")
     keep_cols = ["date", "net_pnl", "return_pct", "trades", "wins", "losses",
-                 "win_rate", "fees", "gross_pnl"]
+                 "win_rate", "gross_pnl", "brokerage", "taxes", "fees"]
     if seg_value is None:
         keep_cols.extend(["equity_net_pnl", "fno_net_pnl",
                           "equity_trades", "fno_trades"])
@@ -990,8 +989,10 @@ def render_history_tab(*, segment: Segment) -> None:
         "wins": "Wins",
         "losses": "Losses",
         "win_rate": "Win rate",
-        "fees": "Fees (₹)",
         "gross_pnl": "Gross P&L (₹)",
+        "brokerage": "Brokerage (₹)",
+        "taxes": "Taxes (₹)",
+        "fees": "Total charges (₹)",
         "equity_net_pnl": "Equity P&L (₹)",
         "fno_net_pnl": "F&O P&L (₹)",
         "equity_trades": "Equity T",
@@ -1001,22 +1002,25 @@ def render_history_tab(*, segment: Segment) -> None:
     if "Win rate" in table_df.columns:
         table_df["Win rate"] = (table_df["Win rate"] * 100).round(0).astype(int).astype(str) + "%"
 
-    # Sort newest-first by default.
     table_df = table_df.iloc[::-1].reset_index(drop=True)
     st.dataframe(
         table_df, width="stretch", hide_index=True,
         column_config={
-            "Net P&L (₹)": st.column_config.NumberColumn(format="%+,.2f"),
-            "Return %":    st.column_config.NumberColumn(format="%+.3f%%"),
-            "Fees (₹)":    st.column_config.NumberColumn(format="%,.2f"),
-            "Gross P&L (₹)": st.column_config.NumberColumn(format="%+,.2f"),
-            "Equity P&L (₹)": st.column_config.NumberColumn(format="%+,.2f"),
-            "F&O P&L (₹)":   st.column_config.NumberColumn(format="%+,.2f"),
+            "Net P&L (₹)":       st.column_config.NumberColumn(format="%+.2f"),
+            "Return %":          st.column_config.NumberColumn(format="%+.3f%%"),
+            "Brokerage (₹)":     st.column_config.NumberColumn(format="%.2f"),
+            "Taxes (₹)":         st.column_config.NumberColumn(format="%.2f"),
+            "Total charges (₹)": st.column_config.NumberColumn(format="%.2f"),
+            "Gross P&L (₹)":     st.column_config.NumberColumn(format="%+.2f"),
+            "Equity P&L (₹)":    st.column_config.NumberColumn(format="%+.2f"),
+            "F&O P&L (₹)":       st.column_config.NumberColumn(format="%+.2f"),
         },
     )
     st.caption(
-        "Click any column header to sort. Days with zero trades are "
-        "included as flat (₹0) rows so the calendar stays continuous."
+        "Click any column header to sort. **Taxes** = STT + exchange + SEBI "
+        "+ stamp duty + GST; **Brokerage** is the broker's flat/percentage "
+        "fee. Days with zero trades are included as flat (₹0) rows so the "
+        "calendar stays continuous."
     )
 
 
