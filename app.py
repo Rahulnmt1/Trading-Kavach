@@ -1503,7 +1503,7 @@ def render_system_tab(cache, segment: Segment) -> None:
 #  PAGE FLOW — top-to-bottom render of the whole dashboard.
 # ════════════════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="Stock Market Bot", layout="wide",
+st.set_page_config(page_title="Trading-Kavach", layout="wide",
                    page_icon="📈")
 st.markdown(_CSS, unsafe_allow_html=True)
 

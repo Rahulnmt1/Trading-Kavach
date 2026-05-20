@@ -1,6 +1,6 @@
-# Stock Market Bot
+# Trading-Kavach
 
-An automated intraday trading bot for the Indian stock market (NSE) with built-in market research, multi-strategy signal generation, hard risk limits, and a live dashboard.
+Trading-Kavach is an automated intraday trading framework for the NSE that runs equity and F&O strategies under a layered risk shield. A 3-strategy ensemble (ORB / VWAP-revert / EMA-Supertrend) and an option-buy directional engine generate signals; four institutional-grade filters (realised-volatility regime, RSI extremes, Bollinger %B fade, multi-source NSE price cross-check) and a fee-aware entry gate decide which actually reach the broker. Hard per-trade and daily-loss kill switches, a pluggable data-source registry (yfinance / Dhan with automatic fallback), durable Redis state, and a live Streamlit dashboard round out the stack. Paper-first by design; live trading is opt-in.
 
 ## ⚠️ Critical disclaimers — read before using
 
