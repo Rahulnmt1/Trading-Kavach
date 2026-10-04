@@ -29,3 +29,116 @@ logs.*-backup-*/
 
 # Local agent / IDE scratch directories
 .claude/
+
+# >>> demo-sync managed block (edit projects.json, not this block) >>>
+# Confidential files live in the private vault: $DEMO_SECRETS_DIR/Trading-Kavach
+# (github.com/Rahulnmt1/secrets). Restore them with ./link-secrets.sh
+
+# secrets
+.env
+.env.*
+*.env
+.envrc
+.dev.vars
+.dev.vars.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.ppk
+*.lic
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+id_rsa*
+id_ed25519*
+CONNECTION-INFO*
+license_*
+.netrc
+.npmrc
+.pypirc
+/.env
+
+# AI assistant artifacts and chat history (mirrored to the private vault)
+.aider/
+.cc-writes/
+.claude/
+.codex/
+.continue/
+.copilot/
+.cursor/
+.gemini/
+.openai/
+.windsurf/
+chat-backup/
+chat-backups/
+chat-history-assets/
+chat-history/
+chat_history/
+conversation-backups/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+GEMINI.md
+.cursorrules
+.windsurfrules
+.aider*
+CHAT_HISTORY*
+CHAT-HISTORY*
+chat-history*
+chat_history*
+CHAT-AND-HANDOFF*
+SESSION_BRIEFING*
+export_chat*
+export-chat*
+update_chat_history*
+*.chat.md
+.chat_history.lock
+
+# dependencies, build output, caches
+node_modules/
+.next/
+.vinext/
+.wrangler/
+.vercel/
+.turbo/
+coverage/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.terraform/
+.cache/
+.gradle/
+target/
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.pid
+*.tsbuildinfo
+*.tar.gz
+*.tgz
+*.zip
+.git.backup-*/
+
+# office documents stay private (mirrored to the vault)
+*.pdf
+*.ppt
+*.pptx
+*.doc
+*.docx
+
+# project-specific
+/.git.backup-pre-rewrite/
+/logs.pre-consolidate-backup-*/
+# <<< demo-sync managed block <<<
