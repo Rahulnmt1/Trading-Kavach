@@ -139,5 +139,5 @@ target/
 
 # project-specific
 /.git.backup-pre-rewrite/
-/logs.pre-consolidate-backup-*/
+/logs.pre-consolidate-backup-2026-05-06/
 # <<< demo-sync managed block <<<
