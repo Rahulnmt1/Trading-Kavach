@@ -12,7 +12,7 @@ FILES=(
 for f in "${FILES[@]}"; do
   src="$VAULT/$f"
   if [ ! -e "$src" ]; then echo "missing in vault: $f" >&2; continue; fi
-  if [ -e "$f" ] && [ ! -L "$f" ]; then echo "skipped (real file present): $f" >&2; continue; fi
+  if [ -e "$f" ] && [ ! -L "$f" ] && [ ! "$f" -ef "$src" ]; then echo "skipped (real file present): $f" >&2; continue; fi
   mkdir -p "$(dirname "$f")"
   ln -sfn "$src" "$f"
   echo "linked $f"
